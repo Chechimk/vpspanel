@@ -100,14 +100,74 @@ ask_port() {
     done
 }
 
-# ask_target_port VAR - local port that a proxy forwards traffic to.
+# ask_port_list VAR NAME EXAMPLE [CURRENT] - several ports separated by spaces,
+# each checked: in use by something else -> dropped, as in ADMRufu.
+# CURRENT lists ports this service already owns (they count as available).
+ask_port_list() {
+    local __v=$1 name=$2 ex=$3 cur=" ${4:-} " __in __pp __ok='' __dots __a
+    while true; do
+        ui_center "ENTER ONE OR MORE PORTS" "$C_WHT"
+        ui_center "SEPARATED BY A SPACE, E.G. $ex" "$C_WHT"
+        ui_line
+        ask __in "$name ports" "${4:-}" || return 1
+        __ok=''
+        for __pp in $__in; do
+            __dots=$(printf '%*s' $(( 14 - ${#__pp} > 1 ? 14 - ${#__pp} : 1 )) '' | tr ' ' '.')
+            if ! valid_port "$__pp"; then
+                printf '                 %sPort %s%s%sINVALID!%s\n' "$C_WHT" "$__pp" "$__dots" "$C_RED" "$C_RST"
+            elif port_in_use "$__pp" && [[ $cur != *" $__pp "* ]]; then
+                printf '                 %sPort %s%s%sIN USE!%s\n' "$C_WHT" "$__pp" "$__dots" "$C_RED" "$C_RST"
+            elif [[ " $__ok " == *" $__pp "* ]]; then
+                :
+            else
+                printf '                 %sPort %s%s%sAVAILABLE!%s\n' "$C_WHT" "$__pp" "$__dots" "$C_GRN" "$C_RST"
+                __ok+="${__ok:+ }$__pp"
+            fi
+        done
+        ui_line
+        printf '     %s[0]%s BACK        %s[1]%s RETRY        %s[2]%s SAVE\n' "$C_GRN" "$C_RST" "$C_GRN" "$C_RST" "$C_GRN" "$C_RST"
+        ui_line
+        read -r -p " ${C_WHT}Enter an option:${C_RST} " __a || return 1
+        case $__a in
+            1) continue ;;
+            2) [[ -n $__ok ]] || { err "None of those ports can be used."; continue; }
+               printf -v "$__v" '%s' "$__ok"; return 0 ;;
+            *) return 1 ;;
+        esac
+    done
+}
+
+# Listening TCP services as "name port" lines (for "forward traffic to" lists).
+local_services() {
+    ss -ltnpH 2>/dev/null | awk '{
+        n = split($4, a, ":"); port = a[n]; name = "?"
+        if (match($0, /users:\(\("[^"]+"/)) name = substr($0, RSTART + 9, RLENGTH - 10)
+        if ($4 ~ /^127\.0\.0\.53/) next
+        print name, port }' | sort -u -k2,2n
+}
+
+# ask_target_port VAR - local port that a proxy forwards traffic to, picked
+# from the list of listening services or typed manually.
 ask_target_port() {
-    local __v=$1 __p __def
-    __def=$(ssh_ports | cut -d, -f1)
-    printf '  Local services: SSH %s' "${__def:-22}"
-    declare -F dropbear_installed > /dev/null && dropbear_installed && printf ', Dropbear %s' "$(dropbear_port)"
-    printf '\n'
-    ask __p "Forward traffic to local port" "${__def:-22}" || return 1
+    local __v=$1 __p n=0 name port line
+    local -a ports=()
+    ui_sep
+    ui_center "WHICH PORT SHOULD THE TRAFFIC BE FORWARDED TO?" "$C_WHT"
+    ui_sep
+    while read -r name port; do
+        [[ -n $port ]] || continue
+        n=$((n + 1)); ports+=("$port")
+        line=$(printf '%s' "${name:0:12}"; printf '%*s' $(( 40 - ${#name} > 2 ? 40 - ${#name} : 2 )) '' | tr ' ' '.'; printf '%s' "$port")
+        printf '  %s[%s]%s > %s%s%s\n' "$C_GRN" "$n" "$C_RST" "$C_WHT" "$line" "$C_RST"
+    done < <(local_services)
+    ui_line
+    printf '  %s[0]%s CANCEL               %s[%s]%s ENTER MANUALLY\n' "$C_GRN" "$C_RST" "$C_GRN" "$((n + 1))" "$C_RST"
+    ui_line
+    ask __p "Enter an option" || return 1
+    if [[ $__p == 0 || -z $__p ]]; then return 1; fi
+    if valid_int "$__p" 1 "$n"; then __p=${ports[__p - 1]}
+    elif [[ $__p == "$((n + 1))" ]]; then ask __p "Local port" "$(ssh_ports | head -n1)" || return 1
+    else err "Invalid option."; return 1; fi
     valid_port "$__p" || { err "Invalid port."; return 1; }
     printf -v "$__v" '%s' "$__p"
 }

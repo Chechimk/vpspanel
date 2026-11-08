@@ -119,14 +119,15 @@ acct_delete() {
     log_event "delete $1"
 }
 
-# acct_renew USER DAYS - extend from today, or from current expiry if still valid.
+# acct_renew USER DAYS [extend] - new expiry = today + DAYS (as in ADMRufu).
+# With "extend", DAYS are added to the current expiry when it is still valid.
 acct_renew() {
-    local user=$1 days=$2 cur base new
+    local user=$1 days=$2 mode=${3:-} cur base new
     _need_account "$user" || return 1
     valid_int "$days" 1 3650 || { err "Days must be 1-3650."; return 1; }
     cur=$(db_field "$user" 2)
     base=$(now_epoch)
-    (( cur > base )) && base=$cur
+    [[ $mode == extend ]] && (( cur > base )) && base=$cur
     new=$(expiry_from_days "$days" "$base")
     chage -E "$(chage_date "$new")" "$user" || return 1
     db_put "$user" "$new" "$(db_field "$user" 3)" "$(db_field "$user" 4)" normal
@@ -198,6 +199,12 @@ acct_enforce() {
         limit=$(db_field "$u" 3)
 
         if (( now >= exp )); then
+            # Temporary users are removed as soon as their minutes run out.
+            if [[ $(db_field "$u" 5) == trial ]]; then
+                acct_kill_sessions "$u"; userdel -f "$u" 2>/dev/null; db_del "$u"
+                log_event "expired temporary user $u deleted"
+                continue
+            fi
             if (( AUTO_DELETE_DAYS > 0 && now >= exp + AUTO_DELETE_DAYS * 86400 )); then
                 acct_kill_sessions "$u"; userdel -f "$u" 2>/dev/null; db_del "$u"
                 log_event "auto-delete $u (expired ${AUTO_DELETE_DAYS}+ days)"
@@ -225,6 +232,40 @@ acct_enforce() {
             | xargs -r kill -KILL 2>/dev/null || true
         log_event "limit $u: closed $excess session(s) over limit $limit"
     done
+    [[ $AUTO_BACKUP == 1 ]] && acct_auto_backup
+    return 0
+}
+
+# One automatic backup per day, keeping the newest 7 automatic ones.
+acct_auto_backup() {
+    local today f
+    today=$(date +%Y%m%d)
+    compgen -G "$VPSP_BACKUP_DIR/vpspanel-backup-auto-$today-*.tar.gz" > /dev/null && return 0
+    [[ -n $(db_users) ]] || return 0
+    mkdir -p "$VPSP_BACKUP_DIR" && chmod 700 "$VPSP_BACKUP_DIR"
+    acct_backup "$VPSP_BACKUP_DIR/vpspanel-backup-auto-$today-$(date +%H%M%S).tar.gz" || return 1
+    ls -1t "$VPSP_BACKUP_DIR"/vpspanel-backup-auto-*.tar.gz 2>/dev/null | tail -n +8 | while IFS= read -r f; do rm -f "$f"; done
+}
+
+# acct_import_admrufu FILE - create accounts from an ADMRufu2.0 user backup
+# (*.admrufu, JSON {"ssh": {"name": {"pass", "expira": "YYYY-MM-DD", "conecciones"}}}).
+# Existing users are skipped. The plain-text passwords are only passed to chpasswd.
+acct_import_admrufu() {
+    local in=$1 user pass expira limit exp created=0 skipped=0
+    [[ -f $in ]] || { err "File not found: $in"; return 1; }
+    has_cmd jq || apt_install jq || return 1
+    jq -e '.ssh | type == "object"' "$in" > /dev/null 2>&1 || { err "Not an ADMRufu user backup (no \"ssh\" object)."; return 1; }
+    while IFS=$'\t' read -r user pass expira limit; do
+        if ! valid_username "$user"; then warn "Skipping '$user': name not allowed."; skipped=$((skipped+1)); continue; fi
+        if acct_os_exists "$user"; then warn "Skipping '$user': user already exists."; skipped=$((skipped+1)); continue; fi
+        [[ $limit =~ ^[0-9]+$ ]] || limit=$DEFAULT_LIMIT
+        if [[ $expira =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] && exp=$(date -d "$expira 23:59:59" +%s 2>/dev/null); then :; else
+            warn "Skipping '$user': unreadable expiry '$expira'."; skipped=$((skipped+1)); continue
+        fi
+        if acct_create "$user" "$pass" "$exp" "$limit" normal; then created=$((created+1)); else skipped=$((skipped+1)); fi
+    done < <(jq -r '.ssh | to_entries[] | [.key, (.value.pass // ""), (.value.expira // ""), ((.value.conecciones // "") | tostring)] | @tsv' "$in")
+    log_event "import-admrufu <- $in created=$created skipped=$skipped"
+    ok "Imported $created account(s), skipped $skipped."
 }
 
 # Delete every panel account. Prints the names removed.

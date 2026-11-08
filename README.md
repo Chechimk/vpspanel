@@ -1,20 +1,17 @@
 # VPSPanel
 
 An independent terminal panel for running an SSH/VPN tunnel service on an
-Ubuntu or Debian VPS. Its menu structure follows the familiar ADMRufu2.0 layout
-(see [docs/ADMRUFU-MENU-MAP.md](docs/ADMRUFU-MENU-MAP.md)), but the whole
-codebase is original. It is English-only and needs no activation key.
+Ubuntu or Debian VPS. Its screens, menu order and workflows follow the
+ADMRufu2.0 panel as observed in a running installation
+([docs/ADMRUFU-FULL-STRUCTURE.md](docs/ADMRUFU-FULL-STRUCTURE.md)), but every
+line of code is original. It is English-only and needs no activation key.
 
-> **Status: v0.2.0, early development.** Everything listed under "Implemented"
-> was tested in disposable Ubuntu 22.04 and 24.04 containers (see "Testing"
-> below). That includes real traffic through OpenSSH, Dropbear, the WebSocket
-> proxy, Stunnel, Squid and the official Xray binary (VLESS+WS, VMess+WS+TLS,
-> VLESS+TCP+TLS). **Hysteria2** is the exception: GitHub kept returning
-> HTTP 504 for its binary during testing, so the module was checked with a
-> stand-in binary and real Hysteria2 traffic is still unverified. Items marked
-> *Coming Soon* in the menu are not implemented yet. Selecting one says so and
-> changes nothing. Try VPSPanel on a test server before using it in
-> production.
+> **Status: v0.3.0 (development branch `develop`).** Everything listed under
+> "Implemented" was tested in disposable Ubuntu 22.04 and 24.04 containers,
+> with real client traffic wherever a client could be run (see "Testing").
+> Items marked *Coming Soon* in the menu are not implemented yet; selecting
+> one says so and changes nothing. Try VPSPanel on a test server before using
+> it in production.
 
 ## One-Command Installation
 
@@ -36,6 +33,14 @@ and settings are always kept); add `--update` to update without being asked.
 If you are logged in as root on a system without `sudo`, run the same command
 with every `sudo ` removed.
 
+### Trying the development branch
+
+To install or update from the `develop` branch on a **test server**:
+
+```bash
+curl -fsSLo vpspanel-install.sh https://raw.githubusercontent.com/Chechimk/vpspanel/develop/quick-install.sh && sudo VPSPANEL_BRANCH=develop bash vpspanel-install.sh
+```
+
 ## Install
 
 ```bash
@@ -51,72 +56,89 @@ The installer:
 - installs a few distribution packages (curl, jq, python3, iptables, ...)
 - copies the panel to `/opt/vpspanel` and keeps settings in `/etc/vpspanel`
 - creates the `menu` and `vpspanel` commands, the `vpsusers` group (panel
-  accounts) and the unprivileged `vpspanel-svc` system user (runs Xray and
-  Hysteria2)
+  accounts) and the unprivileged `vpspanel-svc` system user (runs Xray,
+  Hysteria2 and SlowDNS)
 - enables `vpspanel-guard.timer`, which enforces account expiry and login
   limits every minute
 - appends a validated `Match Group vpsusers` block to `sshd_config`, so panel
   accounts can log in with a password for tunnels only (no shell)
 
 It does **not** change SSH ports, root login, existing firewall rules or other
-users.
+users. Protocols are installed only when you choose them in the menu.
 
-To update, use Panel settings → Update panel. To remove, use Uninstall panel.
-Uninstalling keeps SSH ports and root-login settings, so you can't be locked
-out.
+To update, use Script settings → Update panel (or run the one-command install
+again). To remove, use Uninstall panel. Uninstalling keeps SSH ports and
+root-login settings, so you can't be locked out.
 
 ## Menu
 
+The main menu shows a live dashboard (OS, IP, date and time, disk and CPU,
+RAM, swap, and ACTIVE / EXPIRED / LOCKED / TOTAL / ONLINE account counters;
+each block can be switched off in Script settings), then:
+
 ```
-1  Manage accounts (SSH/Dropbear)   new, temporary, remove, renew, password,
-                                    connection limit, lock, details, online
-                                    monitor, account limiter, delete expired,
-                                    delete all, backups
-2  Manage accounts (V2Ray/Xray)     new, remove, renew, details + share links
-3  Manage accounts (WireGuard)      new client, remove, list, config / QR code
-4  Protocol configuration           SSH, Dropbear, WebSocket/HTTP proxy,
-                                    Stunnel, Hysteria2, Squid, V2Ray/Xray,
-                                    WireGuard (+ Coming Soon items)
-5  Extra tools                      SSL certificates, banner, root access,
-                                    maintenance, blocking rules, BBR, Fail2ban,
-                                    time zone, speedtest
-6  API and bots                     Coming Soon
-7  Panel settings                   auto-start, system information, account
-                                    defaults, log, update, about
-8  Uninstall panel   9  Log out of VPS   10  Reboot VPS   0  Exit
+[1]> MANAGE ACCOUNTS (SSH/DROPBEAR)
+[2]> MANAGE ACCOUNTS (V2RAY/XRAY)      shown once Xray is installed
+[3]> MANAGE ACCOUNTS (WIREGUARD)       shown once WireGuard is installed
+-----
+[n]> PROTOCOL CONFIGURATION
+[n]> EXTRA TOOLS
+-----
+[n]> API AND BOTS                       Coming Soon
+-----
+[n]> SCRIPT SETTINGS
+-----
+[n]> [!] UNINSTALL PANEL
+[0] LOG OUT OF VPS   [n] EXIT PANEL   [n] REBOOT VPS
 ```
 
-On every screen, `0` goes back and `x` exits the panel.
+As in ADMRufu, `0` on the main menu closes the SSH session; *Exit panel*
+returns to the shell. On every other screen `0` goes back, and `x` leaves the
+panel from anywhere.
+
+| Screen | Options |
+|---|---|
+| SSH accounts | New user, temporary user (minutes; shown when enabled), remove, renew (today + days), edit (password + connections), lock/unlock, general password, details of all users, online monitor, account limiter, delete expired, delete all, user backups (incl. daily auto-backup and **import of ADMRufu `.admrufu` backups**), account manager settings (user lists, select by name, temporary-user option, UTC/server dates, defaults) |
+| Protocol configuration | Two-column list with `[ON]`/`[OFF]` and a port summary: SSH settings, Dropbear, SOCKS/WS proxy, Stunnel, SlowDNS, UDP-Custom *(Coming Soon)*, UDP-Hysteria, BadVPN-UDPGW, Squid, OpenVPN, Checkuser, FileBrowser *(Coming Soon)*, V2Ray/Xray, WireGuard |
+| Extra tools | SSL certificates, SSH/Dropbear banner, root password and access, kernel acceleration (BBR or any available algorithm), maintenance (RAM/disk/swap), torrent/port/keyword blocking, Fail2ban, DDoS protection, time zone, speedtest, plugin scripts *(Coming Soon)* |
+| Script settings | Dashboard blocks on/off, auto-start at login, panel name, system details, panel log, update, about |
 
 ## Implemented
 
 | Area | What works |
 |---|---|
-| SSH accounts | Linux users in `vpsusers` with no shell. Expiry, trial hours, login limits (enforced every minute), lock/unlock, backup/restore with password hashes |
+| SSH accounts | Linux users in `vpsusers` with no shell; passwords are stored only as system hashes. Expiry, login limits (enforced every minute), lock/unlock, temporary users deleted after N minutes, general password, backups with password hashes, ADMRufu backup import |
 | OpenSSH | Change ports. The port you are connected through can't be removed, and the change is checked with `sshd -t` and rolled back on error. Ubuntu socket activation is handled |
-| Dropbear | Install, port, restart, uninstall (distribution `dropbear-bin`) |
-| WebSocket / HTTP proxy | Original Python 3 proxy. Answers an HTTP/WebSocket payload with `101` and relays to SSH/Dropbear. Handles split payloads. One systemd instance per port |
-| Stunnel | TLS ports in front of SSH/Dropbear, multiple ports, certificate choice |
-| Squid | HTTP CONNECT proxy restricted to this server only (never an open proxy). The original config is restored on removal |
-| V2Ray / Xray | Official Xray-core release, SHA-256 verified, runs as the unprivileged `vpspanel-svc` user. VLESS/VMess over WS, WS+TLS or TCP+TLS. Users added to every inbound, `vless://`/`vmess://` links, expiry enforced. Recent Xray versions mark VMess and WebSocket as deprecated (XHTTP is on the roadmap) and clients need a real certificate (Let's Encrypt) for TLS |
-| Hysteria2 | Official release, SHA-256 verified. Shared password, optional Salamander obfuscation, `hysteria2://` link |
+| Dropbear | Several ports, manual edit, banner, status/restart/start-stop (distribution `dropbear-bin`) |
+| SOCKS/WS proxy | Original Python 3 proxy, one systemd instance per port. **Direct** mode: answers the HTTP/WebSocket payload with a chosen status (200, 101, ...), optional custom header and mini-banner, then relays to SSH/Dropbear; split payloads handled. **CONNECT** mode: HTTP CONNECT limited to this server's own ports (never an open proxy) |
+| Stunnel | TLS ports in front of SSH/Dropbear, several ports, certificate choice, logs |
+| SlowDNS | `dnstt-server` built from a pinned, commit-verified source tag (Go toolchain from go.dev, SHA-256 verified); NS domain, target port, key pairs (new or your own), UDP 53 → 5300 redirect |
+| UDP-Hysteria | Official Hysteria2 release, SHA-256 verified. **Clients log in with their panel SSH account** (`user:password`, checked by the local `vpspanel-authd`, which also refuses expired and locked accounts), Salamander obfuscation on by default, optional port-hopping range, or a single shared password |
+| BadVPN-UDPGW | Built from the pinned upstream source (checksum verified); several ports on 127.0.0.1 |
+| Squid | HTTP CONNECT proxy restricted to this server only. Logs. The original config is restored on removal |
+| OpenVPN | TCP or UDP, port, cipher, DNS choice. **Clients log in with their panel SSH account** (PAM; expired and locked accounts are refused). One client file, which contains no private key |
+| Checkuser | Same HTTP API as ADMRufu (`GET /` online count, `POST /checkuser {"user":...}` expiry as DDMMYYYY or epoch, UTC or server time); runs unprivileged |
+| V2Ray / Xray | Official Xray-core release, SHA-256 verified, unprivileged. VLESS, VMess, Trojan, Shadowsocks over TCP, WebSocket, gRPC or XHTTP, TLS on or off. Users are added to every inbound with expiry; share links, QR codes and a complete client JSON. View/edit JSON, logs |
 | WireGuard | Server with NAT, clients with config + QR code, port change, NAT re-detection |
 | SSL | Let's Encrypt via certbot (auto-renewal refreshes service copies) and self-signed certificates |
-| Security | Torrent/keyword and spam-port blocking in a dedicated iptables chain that only affects panel traffic, UFW helpers, Fail2ban (your own IP is never banned) |
-| System | Live dashboard (RAM, CPU, disk, swap, load, account counters), BBR, time zone, RAM/disk cleanup, swap file, speedtest, root password/login policy, auto-start at login |
+| Security | Torrent/keyword and spam-port blocking that only affects panel traffic, UFW helpers, Fail2ban (your own IP is never banned), DDoS protection (new connections per minute per IP, block minutes, whitelist) |
+| System | Live dashboard, BBR/congestion control, time zone, RAM/disk cleanup, swap file, speedtest, root password/login policy, auto-start at login |
 
 ## Coming Soon
 
-SlowDNS (DNSTT), UDP Custom, BadVPN UDPGW, OpenVPN, Checkuser, HWID/token
-account modes, traffic quotas, automatic backups, DDoS protection, scheduled
-tasks, plugin scripts, REST API, Telegram bot, WhatsApp bot. Details are in
-[docs/ROADMAP.md](docs/ROADMAP.md).
+UDP-Custom, FileBrowser, HWID/token account modes, Xray traffic accounting
+and REALITY, SSH post-login banner with account details, manually pasted
+certificates, scheduled tasks, plugin scripts, REST API, Telegram bot,
+WhatsApp bot. Details are in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Command line
 
 ```bash
 vpspanel help
 vpspanel create alice Secret123 30 2   # 30 days, 2 simultaneous logins
+vpspanel trial  temp1 Secret123 60     # temporary user, deleted after 60 minutes
+vpspanel renew  alice 30               # expiry = today + 30 days
+vpspanel import-admrufu /root/ADMRufu/userSSH/backups_users_DATE.admrufu
 vpspanel list
 vpspanel backup
 ```
@@ -127,42 +149,54 @@ vpspanel backup
 |---|---|
 | `bin/menu` | Interactive panel (dashboard + all menus) |
 | `bin/vpspanel` | Command-line interface; also used by the guard timer |
-| `bin/vpspanel-dropbear`, `bin/vpspanel-wsproxy` | Service launchers |
+| `bin/vpspanel-wsproxy` | SOCKS/WebSocket/HTTP proxy |
+| `bin/vpspanel-authd` | Account check for Hysteria2 (127.0.0.1 only) |
+| `bin/vpspanel-checkuser` | Checkuser HTTP service |
+| `bin/vpspanel-dropbear` | Dropbear launcher |
 | `lib/common.sh` | Paths, config, colours, prompts, validation |
-| `lib/ui.sh` | Menu framework (Back/Exit, Coming Soon, service helpers) |
-| `lib/accounts.sh` | SSH account database and enforcement |
-| `lib/system.sh` | Host info, OpenSSH settings, BBR, time zone, maintenance |
+| `lib/ui.sh` | Menu framework (frames, footers, two columns, Back/Exit, Coming Soon) |
+| `lib/accounts.sh` | SSH account database, enforcement, backups, ADMRufu import |
+| `lib/system.sh` | Host info, ports, OpenSSH settings, BBR, time zone, maintenance |
 | `modules/*.sh` | One file per protocol or tool |
 | `systemd/` | Guard service and timer |
-| `install.sh`, `update.sh`, `uninstall.sh` | Lifecycle scripts |
+| `install.sh`, `quick-install.sh`, `update.sh`, `uninstall.sh` | Lifecycle scripts |
 | `tests/run.sh` | Test suite |
-| `docs/` | ADMRufu menu map and roadmap |
+| `docs/` | ADMRufu structure, gap analysis, roadmap |
 
 ## Testing
 
 `tests/run.sh` must run as root on a **disposable** machine or container,
-because it creates and deletes accounts and services. It covers:
+because it creates and deletes accounts, services and firewall rules. It
+covers:
 
 - syntax checks and shellcheck
 - a crawl of every menu, checking that every option leads to real code
 - scripted keyboard navigation through a pseudo-terminal (Back, Exit, invalid
-  input, Coming Soon)
-- the account lifecycle, plus real SSH tunnels through OpenSSH, Dropbear, the
-  WebSocket proxy, Stunnel and Squid
-- login-limit enforcement and each protocol module's install and uninstall
+  input, Coming Soon, toggles, Retry/Back on save, dashboard blocks)
+- the account lifecycle, temporary users, auto-backup and ADMRufu import
+- real SSH tunnels through OpenSSH, Dropbear (two ports), the direct proxy,
+  the CONNECT proxy, Stunnel, Squid and SlowDNS (with a real `dnstt-client`)
+- real client traffic through OpenVPN, Hysteria2 and Xray (VLESS WS, VLESS
+  XHTTP, VMess WS, VLESS gRPC+TLS, Trojan TCP+TLS, Shadowsocks), each logging
+  in with a panel account or user, and refusals for wrong credentials
+- login-limit enforcement, Checkuser API, DDoS rate limiting, WireGuard
 
 ```bash
-sudo bash tests/run.sh          # full suite (disposable machine only)
-bash tests/run.sh static        # syntax checks only, safe anywhere
+sudo bash tests/run.sh             # full suite (disposable machine only)
+sudo bash tests/run.sh nav         # menus only
+bash tests/run.sh static           # syntax checks only, safe anywhere
 ```
 
 ## License and independence
 
 VPSPanel contains no ADMRufu2.0 code, binaries, translation catalogs or
-artwork. The menu organisation was studied as a reference only (see
-[docs/ADMRUFU-MENU-MAP.md](docs/ADMRUFU-MENU-MAP.md)). Third-party software
-is installed from the distribution's repositories or from the official
-upstream releases at install time, and is never bundled: Dropbear (MIT),
-stunnel (GPL-2.0+), Squid (GPL-2.0+), Xray-core (MPL-2.0), Hysteria (MIT),
-WireGuard tools (GPL-2.0), certbot (Apache-2.0), Fail2ban (GPL-2.0+),
-speedtest-cli (Apache-2.0).
+artwork. The ADMRufu panel was run in a disposable container with the owner's
+license to observe its behaviour; the observations are documented in
+[docs/ADMRUFU-FULL-STRUCTURE.md](docs/ADMRUFU-FULL-STRUCTURE.md) and compared
+in [docs/VPSPANEL-GAP-ANALYSIS.md](docs/VPSPANEL-GAP-ANALYSIS.md).
+Third-party software is installed from the distribution's repositories or
+from official upstream sources at install time, and is never bundled:
+Dropbear (MIT), stunnel (GPL-2.0+), Squid (GPL-2.0+), OpenVPN (GPL-2.0),
+easy-rsa (GPL-2.0), Xray-core (MPL-2.0), Hysteria (MIT), dnstt (public
+domain), BadVPN (BSD-3-Clause), WireGuard tools (GPL-2.0), certbot
+(Apache-2.0), Fail2ban (GPL-2.0+), speedtest-cli (Apache-2.0).

@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""vpspanel account authentication service (127.0.0.1 only).
+
+Lets proxy servers that cannot read /etc/shadow (Hysteria2 runs as an
+unprivileged user) log clients in with panel SSH accounts.
+
+  POST /auth   Hysteria2 HTTP auth: {"addr": "...", "auth": "user:password", "tx": 0}
+               -> {"ok": true, "id": "user"} or {"ok": false}
+
+An account is accepted only if it is a panel account (accounts.db), is not
+expired, is not locked, and the password matches its shadow hash. Hashes are
+checked with Perl's crypt(), which supports every scheme libcrypt does
+(yescrypt, SHA-512, ...). The password is passed on stdin, never on a command
+line.
+
+Usage: vpspanel-authd [--port 18990] [--db /etc/vpspanel/accounts.db]
+"""
+import argparse
+import json
+import logging
+import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+log = logging.getLogger("authd")
+FAILS = {}                      # addr -> [count, first_failure_time]
+FAILS_LOCK = threading.Lock()
+MAX_FAILS = 10                  # per client address and 10 minutes
+
+
+def account_row(db: str, user: str):
+    try:
+        with open(db, encoding="utf-8") as fh:
+            for line in fh:
+                f = line.rstrip("\n").split(":")
+                if len(f) >= 3 and f[0] == user:
+                    return f
+    except OSError:
+        pass
+    return None
+
+
+def shadow_hash(user: str):
+    try:
+        with open("/etc/shadow", encoding="utf-8") as fh:
+            for line in fh:
+                f = line.split(":")
+                if f[0] == user:
+                    return f[1]
+    except OSError:
+        pass
+    return None
+
+
+def check_password(password: str, hashed: str) -> bool:
+    if not hashed or hashed[0] in "!*" or not hashed.startswith("$"):
+        return False            # locked, disabled or no usable hash
+    script = 'my $h = <STDIN>; my $p = <STDIN>; chomp($h, $p); print crypt($p, $h) eq $h ? "1" : "0";'
+    try:
+        out = subprocess.run(["perl", "-e", script], input=f"{hashed}\n{password}\n",
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return out.stdout.strip() == "1"
+
+
+def authenticate(db: str, auth: str) -> str:
+    if ":" not in auth:
+        return ""
+    user, password = auth.split(":", 1)
+    row = account_row(db, user)
+    if not row:
+        return ""
+    try:
+        if time.time() >= int(row[1]):
+            return ""           # expired
+    except ValueError:
+        return ""
+    return user if check_password(password, shadow_hash(user)) else ""
+
+
+def too_many_failures(addr: str) -> bool:
+    with FAILS_LOCK:
+        n, first = FAILS.get(addr, [0, time.time()])
+        if time.time() - first > 600:
+            FAILS.pop(addr, None)
+            return False
+        return n >= MAX_FAILS
+
+
+def note_failure(addr: str) -> None:
+    with FAILS_LOCK:
+        n, first = FAILS.get(addr, [0, time.time()])
+        FAILS[addr] = [n + 1, first]
+
+
+class Handler(BaseHTTPRequestHandler):
+    db = ""
+
+    def log_message(self, fmt, *args):  # quieter default logging
+        log.debug(fmt, *args)
+
+    def reply(self, code: int, body: dict) -> None:
+        data = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):  # noqa: N802 - http.server API
+        if self.path != "/auth":
+            self.reply(404, {"ok": False})
+            return
+        try:
+            length = min(int(self.headers.get("Content-Length", 0)), 4096)
+            req = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            self.reply(400, {"ok": False})
+            return
+        addr = str(req.get("addr", "")).rsplit(":", 1)[0]
+        if too_many_failures(addr):
+            log.info("too many failures from %s", addr)
+            self.reply(200, {"ok": False})
+            return
+        user = authenticate(self.db, str(req.get("auth", "")))
+        if user:
+            log.info("accepted %s from %s", user, addr)
+            self.reply(200, {"ok": True, "id": user})
+        else:
+            note_failure(addr)
+            log.info("rejected login from %s", addr)
+            self.reply(200, {"ok": False})
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--port", type=int, default=18990)
+    ap.add_argument("--db", default="/etc/vpspanel/accounts.db")
+    args = ap.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    Handler.db = args.db
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    log.info("listening on 127.0.0.1:%d", args.port)
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

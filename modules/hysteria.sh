@@ -1,13 +1,18 @@
 # shellcheck shell=bash
 # vpspanel module: Hysteria2 UDP server (apernet/hysteria, MIT license),
 # downloaded from the official GitHub releases and checked against hashes.txt.
-# Clients authenticate with one shared password; optional Salamander obfuscation.
+# As in ADMRufu, clients log in with a panel SSH account ("user:password",
+# checked by vpspanel-authd), Salamander obfuscation is on by default, and an
+# optional UDP port range is redirected to the server port (port hopping).
+# A single shared password can be used instead of accounts.
 
 HY_BIN=/usr/local/bin/hysteria
 HY_DIR="$VPSP_ETC/hysteria"
-HY_SETTINGS="$HY_DIR/settings"   # PORT, PASSWORD, OBFS, HOST, INSECURE
+HY_SETTINGS="$HY_DIR/settings"   # PORT AUTH PASSWORD OBFS HOST INSECURE HOP
 HY_CONF="$HY_DIR/config.yaml"
 HY_UNIT=/etc/systemd/system/vpspanel-hysteria.service
+AUTHD_UNIT=/etc/systemd/system/vpspanel-authd.service
+AUTHD_PORT=18990
 
 hy_installed() { [[ -x $HY_BIN && -f $HY_UNIT && -f $HY_SETTINGS ]]; }
 
@@ -18,6 +23,37 @@ hy_set() {
     grep -v "^$1=" "$HY_SETTINGS" 2>/dev/null > "$tmp"
     printf '%s=%s\n' "$1" "$2" >> "$tmp"
     install -m 600 "$tmp" "$HY_SETTINGS"; rm -f "$tmp"
+}
+
+# vpspanel-authd: checks panel accounts for proxies that cannot read /etc/shadow.
+authd_ensure() {
+    has_cmd perl || apt_install perl-base || return 1
+    if [[ ! -f $AUTHD_UNIT ]]; then
+        cat > "$AUTHD_UNIT" <<UNIT
+[Unit]
+Description=vpspanel account authentication (127.0.0.1:$AUTHD_PORT)
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/bin/python3 $VPSP_HOME/bin/vpspanel-authd --port $AUTHD_PORT --db $VPSP_DB
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+        systemctl daemon-reload
+    fi
+    systemctl enable --now vpspanel-authd > /dev/null 2>&1
+}
+authd_remove_if_unused() {
+    hy_installed && [[ $(hy_get AUTH) == accounts ]] && return 0
+    systemctl disable --now vpspanel-authd > /dev/null 2>&1 || true
+    rm -f "$AUTHD_UNIT"; systemctl daemon-reload
 }
 
 hy_download() {
@@ -56,40 +92,41 @@ hy_write_conf() {
         echo "  cert: $HY_DIR/tls/cert.pem"
         echo "  key: $HY_DIR/tls/key.pem"
         echo "auth:"
-        echo "  type: password"
-        echo "  password: \"$(hy_get PASSWORD)\""
+        if [[ $(hy_get AUTH) == accounts ]]; then
+            echo "  type: http"
+            echo "  http:"
+            echo "    url: http://127.0.0.1:$AUTHD_PORT/auth"
+        else
+            echo "  type: password"
+            echo "  password: \"$(hy_get PASSWORD)\""
+        fi
         if [[ -n $obfs ]]; then
             echo "obfs:"
             echo "  type: salamander"
             echo "  salamander:"
             echo "    password: \"$obfs\""
         fi
+        echo "quic:"
+        echo "  initStreamReceiveWindow: 16777216"
+        echo "  maxStreamReceiveWindow: 16777216"
+        echo "  initConnReceiveWindow: 33554432"
+        echo "  maxConnReceiveWindow: 33554432"
     } > "$HY_CONF"
     chgrp "$VPSP_SVC_USER" "$HY_CONF" && chmod 640 "$HY_CONF"
 }
 
-hy_restart() {
-    hy_write_conf
-    systemctl restart vpspanel-hysteria || { err "Hysteria failed to start. See: journalctl -u vpspanel-hysteria"; return 1; }
-}
-
-hy_secret() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "${1:-16}"; }
-
-hy_install() {
-    local port=$1 cert=$2 key=$3 host=$4 insecure=$5
-    has_systemd || { err "Hysteria management requires systemd."; return 1; }
-    [[ -x $HY_BIN ]] || hy_download || return 1
-    svc_user_ensure || return 1
-    mkdir -p "$HY_DIR" && chmod 750 "$HY_DIR" && chgrp "$VPSP_SVC_USER" "$HY_DIR"
-    ssl_copy "$cert" "$key" "$HY_DIR/tls" "$VPSP_SVC_USER" || return 1
-    : > "$HY_SETTINGS"
-    hy_set PORT "$port"; hy_set PASSWORD "$(hy_secret 16)"; hy_set OBFS ""
-    hy_set HOST "$host"; hy_set INSECURE "$insecure"
-    hy_write_conf
+# The unit adds/removes the port-hopping redirect with the service.
+hy_write_unit() {
+    local port hop pre='' post=''
+    port=$(hy_get PORT); hop=$(hy_get HOP)
+    if [[ -n $hop ]]; then
+        pre="ExecStartPost=-+/usr/sbin/iptables -t nat -A PREROUTING -p udp --dport $hop -m comment --comment vpspanel-hysteria -j REDIRECT --to-ports $port"
+        post="ExecStopPost=-+/usr/sbin/iptables -t nat -D PREROUTING -p udp --dport $hop -m comment --comment vpspanel-hysteria -j REDIRECT --to-ports $port"
+    fi
     cat > "$HY_UNIT" <<UNIT
 [Unit]
 Description=Hysteria2 server (vpspanel)
-After=network.target
+After=network.target vpspanel-authd.service
 StartLimitIntervalSec=0
 
 [Service]
@@ -101,16 +138,47 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
 NoNewPrivileges=yes
 Restart=on-failure
 RestartSec=3
+${pre}
+${post}
 
 [Install]
 WantedBy=multi-user.target
 UNIT
     systemctl daemon-reload
-    systemctl enable --now vpspanel-hysteria > /dev/null 2>&1 \
-        || { err "Hysteria failed to start. See: journalctl -u vpspanel-hysteria"; return 1; }
+}
+
+hy_restart() {
+    hy_write_conf
+    hy_write_unit
+    [[ $(hy_get AUTH) == accounts ]] && authd_ensure
+    run_step "systemctl restart udp-hysteria" systemctl restart vpspanel-hysteria \
+        || { err "See: journalctl -u vpspanel-hysteria"; return 1; }
+}
+
+hy_secret() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "${1:-16}"; }
+
+# hy_install PORT CERT KEY HOST INSECURE [AUTH] [OBFS] [HOP]
+# AUTH: accounts (default) or password; OBFS: password or "" for none;
+# HOP: "20000:20100" or "" for no port hopping.
+hy_install() {
+    local port=$1 cert=$2 key=$3 host=$4 insecure=$5 auth=${6:-accounts} obfs=${7-$(hy_secret 8)} hop=${8:-}
+    has_systemd || { err "Hysteria management requires systemd."; return 1; }
+    has_cmd iptables || apt_install iptables || return 1
+    [[ -x $HY_BIN ]] || hy_download || return 1
+    svc_user_ensure || return 1
+    mkdir -p "$HY_DIR" && chmod 750 "$HY_DIR" && chgrp "$VPSP_SVC_USER" "$HY_DIR"
+    ssl_copy "$cert" "$key" "$HY_DIR/tls" "$VPSP_SVC_USER" || return 1
+    : > "$HY_SETTINGS"
+    hy_set PORT "$port"; hy_set AUTH "$auth"; hy_set PASSWORD "$(hy_secret 16)"; hy_set OBFS "$obfs"
+    hy_set HOST "$host"; hy_set INSECURE "$insecure"; hy_set HOP "$hop"
+    hy_write_conf
+    hy_write_unit
+    if [[ $auth == accounts ]]; then run_step "systemctl start vpspanel-authd" authd_ensure || return 1; fi
+    run_step "systemctl enable --now udp-hysteria" systemctl enable --now vpspanel-hysteria \
+        || { err "See: journalctl -u vpspanel-hysteria"; return 1; }
     fw_allow "$port" udp
-    log_event "hysteria installed port $port"
-    ok "Hysteria2 is running on UDP port $port."
+    [[ -n $hop ]] && fw_allow "$hop" udp
+    log_event "hysteria installed port $port auth=$auth hop=${hop:-none}"
     hy_show_client
 }
 
@@ -119,39 +187,71 @@ hy_uninstall() {
     rm -f "$HY_UNIT" "$HY_BIN"
     rm -rf "$HY_DIR"
     systemctl daemon-reload
+    authd_remove_if_unused
     log_event "hysteria removed"
     ok "Hysteria2 removed."
 }
 
 hy_show_client() {
-    local host port pass obfs insecure q
-    host=$(hy_get HOST); port=$(hy_get PORT); pass=$(hy_get PASSWORD); obfs=$(hy_get OBFS); insecure=$(hy_get INSECURE)
+    local host port pass obfs insecure q hop auth ports
+    host=$(hy_get HOST); port=$(hy_get PORT); obfs=$(hy_get OBFS); insecure=$(hy_get INSECURE)
+    hop=$(hy_get HOP); auth=$(hy_get AUTH)
+    if [[ $auth == accounts ]]; then pass='USER:PASSWORD'; else pass=$(hy_get PASSWORD); fi
     q="sni=$host"
     [[ $insecure == 1 ]] && q+="&insecure=1"
     [[ -n $obfs ]] && q+="&obfs=salamander&obfs-password=$obfs"
+    ports=$port; [[ -n $hop ]] && ports="$port,${hop/:/-}"
     ui_line
+    ui_kv "Version:" "Hysteria v2"
     ui_kv "Server:" "$host:$port (UDP)"
-    ui_kv "Password:" "$pass"
+    [[ -n $hop ]] && ui_kv "Port hopping:" "${hop/:/-} > $port"
+    if [[ $auth == accounts ]]; then ui_kv "Login:" "a panel SSH account (user:password)"
+    else ui_kv "Password:" "$(hy_get PASSWORD)"; fi
     ui_kv "Obfuscation:" "${obfs:+salamander / $obfs}${obfs:-none}"
     ui_kv "TLS check:" "$([[ $insecure == 1 ]] && echo "skip (self-signed certificate)" || echo verify)"
-    printf '\n  hysteria2://%s@%s:%s/?%s#vpspanel\n' "$pass" "$host" "$port" "$q"
+    printf '\n  hysteria2://%s@%s:%s/?%s#vpspanel\n' "$pass" "$host" "$ports" "$q"
+    [[ $auth == accounts ]] && info "Replace USER:PASSWORD with the customer's account."
 }
 
 # ------------------------------------------------------------------ menu ---
 hy_info() {
-    ui_kv "Status:" "$(fmt_state "$(svc_state vpspanel-hysteria)")"
-    hy_installed && ui_kv "UDP port:" "$(hy_get PORT)"
-    return 0
+    if hy_installed; then
+        printf ' %sVERSION:%s HYSTERIA V2   %sPORT:%s %s   %sLOGIN:%s %s\n' "$C_GRN" "$C_RST" "$C_GRN" "$C_RST" "$(hy_get PORT)" \
+            "$C_GRN" "$C_RST" "$( [[ $(hy_get AUTH) == accounts ]] && echo "SSH accounts" || echo "shared password")"
+        [[ -n $(hy_get HOP) ]] && printf ' %sREDIRECT:%s %s > %s\n' "$C_GRN" "$C_RST" "$(hy_get HOP)" "$(hy_get PORT)"
+        printf ' %sOBFS:%s %s\n' "$C_GRN" "$C_RST" "$(hy_get OBFS || true)"
+    else
+        ui_center "HYSTERIA V2 - LOGIN WITH PANEL SSH ACCOUNTS" "$C_YLW"
+    fi
+}
+
+hy_ask_hop() {
+    local __v=$1 r a b
+    info "Optional port hopping: a UDP range redirected to the server port, e.g. 20000:20100."
+    ask r "Port range (Enter = none)" || return 1
+    [[ -z $r ]] && { printf -v "$__v" '%s' ''; return 0; }
+    [[ $r =~ ^([0-9]{1,5})[:-]([0-9]{1,5})$ ]] || { err "Use FROM:TO, e.g. 20000:20100."; return 1; }
+    a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}
+    valid_port "$a" && valid_port "$b" && (( a < b )) || { err "Invalid range."; return 1; }
+    if ss -lunH 2>/dev/null | awk '{n = split($4, x, ":"); print x[n]}' | awk -v a="$a" -v b="$b" '$1 >= a && $1 <= b {f = 1} END {exit !f}'; then
+        err "Another UDP service listens inside $a:$b; choose a range that does not overlap it."; return 1
+    fi
+    printf -v "$__v" '%s' "$a:$b"
 }
 
 m_hy_install() {
-    local port cert key host insecure=0
+    local port cert key host insecure=0 auth=accounts obfs hop a
     ask_port port "UDP port" 36712 udp || return
+    hy_ask_hop hop || return
+    ask a "Login with [1] panel SSH accounts or [2] one shared password" 1 || return
+    [[ $a == 2 ]] && auth=password
+    obfs=$(hy_secret 8)
+    confirm "Enable Salamander obfuscation (recommended)?" || obfs=''
     ssl_pick cert key || return
     [[ $cert == "$SSL_SELF"/* ]] && insecure=1
     host=$(openssl x509 -noout -subject -in "$cert" 2>/dev/null | sed -n 's/.*CN *= *//p')
     ask host "Address clients connect to" "${host:-$(sys_ip)}" || return
-    hy_install "$port" "$cert" "$key" "$host" "$insecure"
+    hy_install "$port" "$cert" "$key" "$host" "$insecure" "$auth" "$obfs" "$hop"
 }
 
 m_hy_port() {
@@ -162,9 +262,26 @@ m_hy_port() {
     hy_set PORT "$p" && hy_restart && fw_allow "$p" udp && ok "Hysteria2 now listens on UDP $p."
 }
 
+m_hy_hop() {
+    local h
+    hy_ask_hop h || return
+    hy_set HOP "$h" && hy_restart && { [[ -z $h ]] || fw_allow "$h" udp; } && ok "Port hopping: ${h:-off}."
+}
+
+m_hy_auth() {
+    if [[ $(hy_get AUTH) == accounts ]]; then
+        confirm "Switch to one shared password for every client?" || return 0
+        hy_set AUTH password
+    else
+        confirm "Switch to login with panel SSH accounts?" || return 0
+        hy_set AUTH accounts
+    fi
+    hy_restart && authd_remove_if_unused && ok "Login method changed. Update your clients."
+}
+
 m_hy_pass() {
     local p
-    ask p "New password (leave the default for a random one)" "$(hy_secret 16)" || return
+    ask p "New shared password (leave the default for a random one)" "$(hy_secret 16)" || return
     [[ $p =~ ^[A-Za-z0-9_.-]{6,64}$ ]] || { err "Use 6-64 letters, digits, '_', '.' or '-'."; return 1; }
     hy_set PASSWORD "$p" && hy_restart && ok "Password changed. Update your clients."
 }
@@ -172,7 +289,7 @@ m_hy_pass() {
 m_hy_obfs() {
     local p
     info "Leave empty to turn obfuscation off."
-    ask p "Salamander obfuscation password" || return
+    ask p "Salamander obfuscation password" "$(hy_secret 8)" || return
     [[ -z $p || $p =~ ^[A-Za-z0-9_.-]{6,64}$ ]] || { err "Use 6-64 letters, digits, '_', '.' or '-'."; return 1; }
     hy_set OBFS "$p" && hy_restart && ok "Obfuscation ${p:+enabled}${p:-disabled}."
 }
@@ -191,19 +308,25 @@ hysteria_menu() {
     local -a items
     while true; do
         if hy_installed; then
-            items=("Show client settings / share link|hy_show_client"
-                   "Change port|m_hy_port"
-                   "Change password|m_hy_pass"
-                   "Obfuscation (Salamander)|m_hy_obfs"
-                   "Change certificate|m_hy_cert"
-                   "Service status|show_service_status vpspanel-hysteria"
-                   "Restart service|restart_service vpspanel-hysteria"
-                   "Start / stop service|toggle_service vpspanel-hysteria"
-                   "Live log|follow_log journalctl -u vpspanel-hysteria -n 30 -f"
-                   "Uninstall Hysteria2|m_hy_uninstall")
+            items=("SHOW CLIENT SETTINGS / SHARE LINK|hy_show_client"
+                   -
+                   "CHANGE PORT|m_hy_port"
+                   "PORT HOPPING RANGE|m_hy_hop"
+                   "MODIFY OBFS|m_hy_obfs"
+                   "LOGIN METHOD (ACCOUNTS / SHARED PASSWORD)|m_hy_auth")
+            [[ $(hy_get AUTH) == accounts ]] || items+=("CHANGE SHARED PASSWORD|m_hy_pass")
+            items+=("CHANGE CERTIFICATE|m_hy_cert"
+                    -
+                    "SERVICE STATUS|show_service_status vpspanel-hysteria"
+                    "RESTART SERVICE|restart_service vpspanel-hysteria"
+                    "START/STOP SERVICE $(st_state "$(svc_state vpspanel-hysteria)")|toggle_service vpspanel-hysteria"
+                    -
+                    "LOG UDP-HYSTERIA|journalctl -u vpspanel-hysteria -n 40 --no-pager"
+                    "LIVE LOG|follow_log journalctl -u vpspanel-hysteria -n 30 -f"
+                    "@UNINSTALL|m_hy_uninstall")
         else
-            items=("Install Hysteria2|m_hy_install")
+            items=("INSTALL UDP-HYSTERIA (V2)|m_hy_install")
         fi
-        menu_show "HYSTERIA2 (UDP) MANAGER" hy_info "${items[@]}" || return 0
+        menu_show "UDP-HYSTERIA MANAGER" hy_info "${items[@]}" || return 0
     done
 }

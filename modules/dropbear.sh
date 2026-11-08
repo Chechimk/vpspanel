@@ -2,25 +2,26 @@
 # vpspanel module: Dropbear SSH server.
 # Uses the distribution's dropbear-bin package (MIT license) and a panel-owned
 # systemd unit, so behaviour is the same on every supported Debian/Ubuntu release.
+# Dropbear can listen on several ports (stored space-separated in dropbear.port).
 
 DROPBEAR_UNIT=/etc/systemd/system/vpspanel-dropbear.service
 DROPBEAR_PORT_FILE="$VPSP_ETC/dropbear.port"
 
 dropbear_installed() { [[ -x /usr/sbin/dropbear && -f $DROPBEAR_UNIT ]]; }
-dropbear_port()      { cat "$DROPBEAR_PORT_FILE" 2>/dev/null || echo "-"; }
+dropbear_ports()     { tr -s ' \n' '\n' < "$DROPBEAR_PORT_FILE" 2>/dev/null | grep -E '^[0-9]+$'; }
+dropbear_port()      { local p; p=$(dropbear_ports | head -n1); echo "${p:--}"; }
 
+# dropbear_install "PORT [PORT...]"
 dropbear_install() {
-    local port=$1
-    valid_port "$port" || { err "Invalid port: $port"; return 1; }
+    local ports=$1 p
     has_systemd || { err "Dropbear management requires systemd."; return 1; }
-    if port_in_use "$port" && [[ $(dropbear_port) != "$port" ]]; then
-        err "Port $port is already in use."; return 1
-    fi
-    apt_install dropbear-bin || return 1
+    [[ -n $ports ]] || { err "No port given."; return 1; }
+    for p in $ports; do valid_port "$p" || { err "Invalid port: $p"; return 1; }; done
+    run_step "apt install dropbear-bin" apt_install dropbear-bin || return 1
     # The distribution's own dropbear service (if any) would fight over ports.
     systemctl disable --now dropbear > /dev/null 2>&1 || true
     mkdir -p /etc/dropbear "$VPSP_ETC"
-    echo "$port" > "$DROPBEAR_PORT_FILE"
+    echo "$ports" > "$DROPBEAR_PORT_FILE"
     cat > "$DROPBEAR_UNIT" <<UNIT
 [Unit]
 Description=Dropbear SSH server (vpspanel)
@@ -35,25 +36,25 @@ RestartSec=3
 WantedBy=multi-user.target
 UNIT
     systemctl daemon-reload
-    systemctl enable --now vpspanel-dropbear > /dev/null 2>&1 \
-        || { err "Dropbear failed to start. See: journalctl -u vpspanel-dropbear"; return 1; }
-    fw_allow "$port"
-    log_event "dropbear installed on port $port"
-    ok "Dropbear is running on port $port."
+    run_step "systemctl enable --now dropbear" systemctl enable --now vpspanel-dropbear \
+        || { err "See: journalctl -u vpspanel-dropbear"; return 1; }
+    for p in $ports; do fw_allow "$p"; done
+    log_event "dropbear installed on ports $ports"
 }
 
-dropbear_set_port() {
-    local port=$1
+# dropbear_set_ports "PORT [PORT...]"
+dropbear_set_ports() {
+    local ports=$1 p
     dropbear_installed || { err "Dropbear is not installed."; return 1; }
-    valid_port "$port" || { err "Invalid port: $port"; return 1; }
-    [[ $port == "$(dropbear_port)" ]] && { info "Dropbear already uses port $port."; return 0; }
-    port_in_use "$port" && { err "Port $port is already in use."; return 1; }
-    echo "$port" > "$DROPBEAR_PORT_FILE"
-    systemctl restart vpspanel-dropbear || return 1
-    fw_allow "$port"
-    log_event "dropbear port $port"
-    ok "Dropbear now listens on port $port."
+    [[ -n $ports ]] || { err "No port given."; return 1; }
+    for p in $ports; do valid_port "$p" || { err "Invalid port: $p"; return 1; }; done
+    echo "$ports" > "$DROPBEAR_PORT_FILE"
+    run_step "systemctl restart dropbear" systemctl restart vpspanel-dropbear || return 1
+    for p in $ports; do fw_allow "$p"; done
+    log_event "dropbear ports $ports"
 }
+# Kept for the command line and older scripts.
+dropbear_set_port() { dropbear_set_ports "$1"; }
 
 dropbear_remove() {
     if has_systemd; then
@@ -68,26 +69,43 @@ dropbear_remove() {
 
 # ------------------------------------------------------------------ menu ---
 dropbear_info() {
-    ui_kv "Status:" "$(fmt_state "$(svc_state vpspanel-dropbear)")"
-    ui_kv "Port:" "$(dropbear_port)"
+    if dropbear_installed; then
+        printf '      %sPORTS:%s %s\n' "$C_GRN" "$C_RST" "$(dropbear_ports | paste -sd' ' -)"
+    else
+        ui_center "If the install freezes on Debian, press Ctrl+C and retry." "$C_YLW"
+    fi
 }
 
-m_dropbear_install() { local p; ask_port p "Dropbear port" 143 && dropbear_install "$p"; }
-m_dropbear_port()    { local p; ask p "New Dropbear port" && dropbear_set_port "$p"; }
+m_dropbear_install() {
+    local p
+    ask_port_list p "Dropbear" "80 90 109 110 143 443" || return
+    dropbear_install "$p"
+}
+m_dropbear_port() {
+    local p
+    ask_port_list p "Dropbear" "80 90 109 110 143 443" "$(dropbear_ports | paste -sd' ' -)" || return
+    dropbear_set_ports "$p"
+}
+m_dropbear_edit() {
+    "${EDITOR:-nano}" "$DROPBEAR_PORT_FILE"
+    dropbear_set_ports "$(dropbear_ports | paste -sd' ' -)"
+}
 m_dropbear_remove()  { confirm "Uninstall Dropbear? Clients connected through it will be disconnected." && dropbear_remove; }
 
 dropbear_menu() {
     local -a items
     while true; do
         if dropbear_installed; then
-            items=("Change port|m_dropbear_port"
-                   "Service status|show_service_status vpspanel-dropbear"
-                   "Restart service|restart_service vpspanel-dropbear"
-                   "Start / stop service|toggle_service vpspanel-dropbear"
-                   "SSH/Dropbear banner|>banner_menu"
-                   "Uninstall Dropbear|m_dropbear_remove")
+            items=("REDEFINE PORTS|m_dropbear_port"
+                   "MANUAL CONFIGURATION (nano)|m_dropbear_edit"
+                   "SSH/DROPBEAR BANNER|>banner_menu"
+                   -
+                   "SERVICE STATUS|show_service_status vpspanel-dropbear"
+                   "RESTART SERVICE|restart_service vpspanel-dropbear"
+                   "START/STOP SERVICE $(st_state "$(svc_state vpspanel-dropbear)")|toggle_service vpspanel-dropbear"
+                   "@UNINSTALL DROPBEAR|m_dropbear_remove")
         else
-            items=("Install Dropbear|m_dropbear_install")
+            items=("INSTALL DROPBEAR|m_dropbear_install")
         fi
         menu_show "DROPBEAR MANAGER" dropbear_info "${items[@]}" || return 0
     done

@@ -182,12 +182,12 @@ wireguard_menu() {
 }
 
 m_wgc_pick() {
-    local __v=$1 n
+    local __v=$1 __n
     [[ -n $(wg_clients) ]] || { info "There are no clients."; return 1; }
     printf '  Clients: %s\n' "$(wg_clients | paste -sd' ' -)"
-    ask n "Client name" || return 1
-    [[ -f $WG_CLIENTS/$n.conf ]] || { err "No client named $n."; return 1; }
-    printf -v "$__v" '%s' "$n"
+    ask __n "Client name" || return 1
+    [[ -f $WG_CLIENTS/$__n.conf ]] || { err "No client named $__n."; return 1; }
+    printf -v "$__v" '%s' "$__n"
 }
 
 m_wgc_new()  { local n; ask n "Client name" && wg_client_add "$n" && wg_client_show "$n"; }

@@ -1,5 +1,10 @@
 # ADMRufu2.0 → VPSPanel menu map
 
+> **Superseded.** This first map was built from translation catalogs and
+> string tables only. The panel has since been installed and explored; the
+> observed structure is in [ADMRUFU-FULL-STRUCTURE.md](ADMRUFU-FULL-STRUCTURE.md),
+> which takes precedence wherever the two differ.
+
 This document records how the ADMRufu2.0 menu is organised and where each part
 lives in VPSPanel. VPSPanel uses it only as an organisational reference. Every
 VPSPanel screen is original Bash code. No ADMRufu binary, source, translation

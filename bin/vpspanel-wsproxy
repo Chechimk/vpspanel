@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 """vpspanel WebSocket / HTTP proxy.
 
-Accepts a connection, reads the HTTP request (or several, for clients that
-send a split payload), answers with a "101 Switching Protocols" style status
-line, then relays raw bytes to a local port (normally SSH or Dropbear).
+Two modes:
 
-Usage: vpspanel-wsproxy --port 80 --target 22 [--status "Switching Protocols"]
+direct   (default) Reads the client's HTTP request (or several, for clients
+         that send a split payload), answers with a status line such as
+         "HTTP/1.1 101 Switching Protocols", optionally followed by a custom
+         header block, then relays raw bytes to one local port (SSH/Dropbear).
+
+connect  An HTTP CONNECT proxy that only reaches this server: "CONNECT
+         host:PORT" is relayed to 127.0.0.1:PORT, and only if PORT is in the
+         --allow list. Other hosts are never contacted (no open proxy).
+
+Usage:
+  vpspanel-wsproxy --port 80 --target 22 [--code 101] [--status TEXT] [--header-b64 B64]
+  vpspanel-wsproxy --mode connect --port 8080 --allow 22,143
 """
 import argparse
 import asyncio
+import base64
 import logging
 import re
 import signal
@@ -17,6 +27,8 @@ MAX_HEADER = 16 * 1024          # bytes of request headers we are willing to rea
 HEADER_TIMEOUT = 10             # seconds to wait for the request headers
 CHUNK = 64 * 1024
 METHOD = re.compile(rb"^[A-Z]{3,10} \S+ HTTP/1\.[01]\r?\n")
+CONNECT = re.compile(rb"^CONNECT \[?([^\]\s]+?)\]?:(\d{1,5}) HTTP/1\.[01]\r?\n")
+DEFAULT_TEXT = {101: "Switching Protocols", 200: "Connection established"}
 
 log = logging.getLogger("wsproxy")
 
@@ -51,6 +63,20 @@ async def read_headers(reader: asyncio.StreamReader, buf: bytes) -> bytes:
         buf += data
 
 
+async def read_one_request(reader: asyncio.StreamReader) -> tuple:
+    """Read exactly one header block. Returns (headers, bytes after it)."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        if len(buf) > MAX_HEADER:
+            raise ValueError("request headers too large")
+        data = await asyncio.wait_for(reader.read(CHUNK), timeout=HEADER_TIMEOUT)
+        if not data:
+            raise ConnectionError("client closed before sending headers")
+        buf += data
+    end = buf.find(b"\r\n\r\n")
+    return buf[:end + 4], buf[end + 4:]
+
+
 async def pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
     try:
         while True:
@@ -68,18 +94,47 @@ async def pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
             pass
 
 
-async def handle(reader, writer, target: int, status: bytes) -> None:
+async def relay(reader, writer, port: int, early: bytes) -> None:
+    up_reader, up_writer = await asyncio.open_connection("127.0.0.1", port)
+    if early:
+        up_writer.write(early)
+        await up_writer.drain()
+    await asyncio.gather(pipe(reader, up_writer), pipe(up_reader, writer))
+
+
+async def handle_direct(reader, writer, args, response: bytes) -> None:
+    first = await asyncio.wait_for(reader.read(CHUNK), timeout=HEADER_TIMEOUT)
+    rest = await read_headers(reader, first)
+    writer.write(response)
+    await writer.drain()
+    await relay(reader, writer, args.target, rest)
+
+
+async def handle_connect(reader, writer, args, allowed: set) -> None:
+    head, rest = await read_one_request(reader)
+    m = CONNECT.match(head)
+    if not m:
+        writer.write(b"HTTP/1.1 405 Method Not Allowed\r\nAllow: CONNECT\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+        return
+    port = int(m.group(2))
+    if port not in allowed:
+        writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+        await writer.drain()
+        log.info("refused CONNECT to %s:%d", m.group(1).decode(errors="replace"), port)
+        return
+    writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+    await writer.drain()
+    await relay(reader, writer, port, rest)
+
+
+async def handle(reader, writer, args, extra) -> None:
     peer = writer.get_extra_info("peername")
     try:
-        first = await asyncio.wait_for(reader.read(CHUNK), timeout=HEADER_TIMEOUT)
-        rest = await read_headers(reader, first)
-        writer.write(b"HTTP/1.1 101 " + status + b"\r\n\r\n")
-        await writer.drain()
-        up_reader, up_writer = await asyncio.open_connection("127.0.0.1", target)
-        if rest:
-            up_writer.write(rest)
-            await up_writer.drain()
-        await asyncio.gather(pipe(reader, up_writer), pipe(up_reader, writer))
+        if args.mode == "connect":
+            await handle_connect(reader, writer, args, extra)
+        else:
+            await handle_direct(reader, writer, args, extra)
     except (asyncio.TimeoutError, ConnectionError, ValueError, OSError) as exc:
         log.info("%s: %s", peer, exc)
     finally:
@@ -89,19 +144,50 @@ async def handle(reader, writer, target: int, status: bytes) -> None:
             pass
 
 
+def build_response(code: int, text: str, header_b64: str) -> bytes:
+    text = re.sub(r"[\r\n]", "", text or DEFAULT_TEXT.get(code, "OK"))[:200]
+    out = f"HTTP/1.1 {code} {text}\r\n".encode()
+    if code == 101:
+        out += b"Connection: Upgrade\r\nUpgrade: websocket\r\n"
+    out += b"\r\n"
+    if header_b64:
+        # Custom bytes sent after the response, e.g. "HTTP/1.1 200 OK\r\n\r\n".
+        out += base64.b64decode(header_b64)[:4096]
+    return out
+
+
 async def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--mode", choices=("direct", "connect", ""), default="direct")
     ap.add_argument("--port", type=int, required=True, help="listening port")
-    ap.add_argument("--target", type=int, required=True, help="local port to relay to")
-    ap.add_argument("--status", default="Switching Protocols", help="text after the 101 status code")
+    ap.add_argument("--target", default="22", help="direct: local port to relay to")
+    ap.add_argument("--code", default="101", help="direct: response status code")
+    ap.add_argument("--status", default="", help="direct: text after the status code (banner)")
+    ap.add_argument("--header-b64", default="", help="direct: extra bytes after the response, base64")
+    ap.add_argument("--allow", default="", help="connect: comma-separated local ports clients may reach")
     ap.add_argument("--listen", default="0.0.0.0", help="listening address")
     args = ap.parse_args()
-    status = re.sub(r"[\r\n]", "", args.status).encode()[:120] or b"Switching Protocols"
+    # Settings files written by older versions leave some values empty.
+    args.mode = args.mode or "direct"
+    try:
+        args.target = int(args.target or 22)
+        args.code = int(args.code or 101)
+    except ValueError:
+        ap.error("--target and --code must be numbers")
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    if args.mode == "connect":
+        extra = {int(p) for p in args.allow.split(",") if p.strip().isdigit()}
+        what = "CONNECT to 127.0.0.1 ports %s" % sorted(extra)
+    else:
+        if not 100 <= args.code <= 599:
+            ap.error("--code must be 100-599")
+        extra = build_response(args.code, args.status, args.header_b64)
+        what = "relaying to 127.0.0.1:%d with status %d" % (args.target, args.code)
+
     server = await asyncio.start_server(
-        lambda r, w: handle(r, w, args.target, status), args.listen, args.port, reuse_address=True)
-    log.info("listening on %s:%d, relaying to 127.0.0.1:%d", args.listen, args.port, args.target)
+        lambda r, w: handle(r, w, args, extra), args.listen, args.port, reuse_address=True)
+    log.info("listening on %s:%d, %s", args.listen, args.port, what)
 
     stop = asyncio.get_running_loop().create_future()
     for sig in (signal.SIGTERM, signal.SIGINT):

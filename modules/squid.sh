@@ -104,6 +104,8 @@ squid_menu() {
                    "Service status|show_service_status squid"
                    "Restart service|restart_service squid"
                    "Start / stop service|toggle_service squid"
+                   "Connection log|show_log /var/log/squid/access.log"
+                   "Cache and error log|show_log /var/log/squid/cache.log"
                    "Connection log (live)|follow_log tail -n 30 -f /var/log/squid/access.log"
                    "Uninstall Squid|m_squid_uninstall")
         else

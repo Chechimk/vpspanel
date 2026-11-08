@@ -1,13 +1,14 @@
 #!/bin/bash
-# Launcher used by vpspanel-dropbear.service. Reads the port and optional
+# Launcher used by vpspanel-dropbear.service. Reads the ports and optional
 # banner chosen in the panel, then runs Dropbear in the foreground.
 set -euo pipefail
 
 ETC=${VPSP_ETC:-/etc/vpspanel}
-port=$(cat "$ETC/dropbear.port" 2>/dev/null || echo 143)
-[[ $port =~ ^[0-9]+$ ]] || { echo "invalid port in $ETC/dropbear.port" >&2; exit 1; }
-
-args=(-F -E -R -p "$port")
+args=(-F -E -R -K 10)
+for port in $(cat "$ETC/dropbear.port" 2>/dev/null || echo 143); do
+    [[ $port =~ ^[0-9]+$ ]] || { echo "invalid port '$port' in $ETC/dropbear.port" >&2; exit 1; }
+    args+=(-p "$port")
+done
 [[ -s $ETC/banner.txt ]] && args+=(-b "$ETC/banner.txt")
 
 exec /usr/sbin/dropbear "${args[@]}"

@@ -2,7 +2,7 @@
 # vpspanel - shared helpers: paths, config, UI, logging, validation.
 # This file is sourced by the panel commands; it is never executed directly.
 
-VPSP_VERSION="0.2.0"
+VPSP_VERSION="0.3.0"
 
 # All paths can be overridden from the environment (used by the test suite).
 VPSP_HOME="${VPSP_HOME:-/opt/vpspanel}"
@@ -23,8 +23,25 @@ AUTO_DELETE_DAYS=0       # delete accounts N days after expiry (0 = never)
 BANNER_TEXT=""           # SSH login banner shown to clients
 LIMIT_EXPIRED=1          # guard closes sessions of expired accounts (1/0)
 LIMIT_LOGINS=1           # guard enforces simultaneous-login limits (1/0)
+PANEL_NAME="VPSPanel"    # name shown at the top of the main menu
+DASH_COUNTERS=1          # main-menu header blocks (Script settings)
+DASH_SYSINFO=1
+DASH_DISKCPU=1
+DASH_RAM=1
+DASH_SWAP=0
+GEN_PASS_ON=0            # general password: new users get GEN_PASS
+GEN_PASS=""
+SHOW_LIST_NEW=1          # show the user table in each account action
+SHOW_LIST_DEL=1
+SHOW_LIST_RENEW=1
+SHOW_LIST_EDIT=1
+SHOW_LIST_LOCK=1
+SELECT_BY_NAME=0         # pick users by name instead of number
+SHOW_TEMP=0              # show "Create temporary user"
+LOCAL_TIME=1             # show dates in the server time zone (0 = UTC)
+AUTO_BACKUP=0            # daily automatic account backup
 
-readonly VPSP_CONF_KEYS="DEFAULT_LIMIT DEFAULT_DAYS AUTO_DELETE_DAYS BANNER_TEXT LIMIT_EXPIRED LIMIT_LOGINS"
+readonly VPSP_CONF_KEYS="DEFAULT_LIMIT DEFAULT_DAYS AUTO_DELETE_DAYS BANNER_TEXT LIMIT_EXPIRED LIMIT_LOGINS PANEL_NAME DASH_COUNTERS DASH_SYSINFO DASH_DISKCPU DASH_RAM DASH_SWAP GEN_PASS_ON GEN_PASS SHOW_LIST_NEW SHOW_LIST_DEL SHOW_LIST_RENEW SHOW_LIST_EDIT SHOW_LIST_LOCK SELECT_BY_NAME SHOW_TEMP LOCAL_TIME AUTO_BACKUP"
 
 # Parse panel.conf without executing it.
 load_config() {
@@ -59,8 +76,12 @@ set_config() {
 if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
     C_RED=$'\e[1;31m' C_GRN=$'\e[1;32m' C_YLW=$'\e[1;33m' C_BLU=$'\e[1;34m'
     C_CYN=$'\e[1;36m' C_BLD=$'\e[1m' C_DIM=$'\e[2m' C_RST=$'\e[0m'
+    C_WHT=$'\e[1;97m'     # item labels and values
+    C_FRM=$'\e[0;31m'     # frame lines (red)
+    C_BG_RED=$'\e[1;97;41m' C_BG_GRY=$'\e[1;97;100m' C_BG_BLU=$'\e[1;97;44m'
 else
     C_RED='' C_GRN='' C_YLW='' C_BLU='' C_CYN='' C_BLD='' C_DIM='' C_RST=''
+    C_WHT='' C_FRM='' C_BG_RED='' C_BG_GRY='' C_BG_BLU=''
 fi
 
 info() { printf '%s\n' "${C_CYN}[i]${C_RST} $*"; }
@@ -69,35 +90,60 @@ warn() { printf '%s\n' "${C_YLW}[!]${C_RST} $*" >&2; }
 err()  { printf '%s\n' "${C_RED}[x]${C_RST} $*" >&2; }
 die()  { err "$*"; exit 1; }
 
-# Screen width follows the terminal, between 40 and 64 columns. Box-drawing
-# characters are used only when the locale is UTF-8.
-UI_W=60 UI_RULE="" UI_ARROW=">"
+# Screens are 60 columns wide (down to 40 on narrow terminals). Frames use
+# box-drawing characters.
+UI_W=60 UI_RULE="" UI_SEP="" UI_THIN="" UI_ARROW=">"
 ui_refresh_width() {
-    local c=${COLUMNS:-} ch='-' i
-    [[ -n $c ]] || c=$(tput cols 2>/dev/null) || c=64
-    [[ $c =~ ^[0-9]+$ ]] || c=64
-    (( c > 64 )) && c=64
+    local c=${COLUMNS:-} ch='=' th='-' i
+    [[ -n $c ]] || c=$(tput cols 2>/dev/null) || c=60
+    [[ $c =~ ^[0-9]+$ ]] || c=60
+    (( c > 60 )) && c=60
     (( c < 40 )) && c=40
     UI_W=$c
-    UI_ARROW=">"
-    if [[ ${LC_ALL:-${LC_CTYPE:-${LANG:-}}} == *[Uu][Tt][Ff]* ]]; then ch='━'; UI_ARROW='›'; fi
-    UI_RULE=""
-    for (( i = 0; i < UI_W; i++ )); do UI_RULE+=$ch; done
+    # Like ADMRufu, always draw box characters; VPSP_ASCII=1 falls back to plain ASCII.
+    [[ ${VPSP_ASCII:-0} == 1 ]] || { ch='═'; th='─'; }
+    UI_RULE="" UI_SEP="" UI_THIN=""
+    for (( i = 0; i < UI_W; i++ )); do UI_RULE+=$ch; UI_SEP+='-'; UI_THIN+=$th; done
 }
 ui_refresh_width
 
-ui_line()   { printf '%s\n' "${C_BLU}${UI_RULE}${C_RST}"; }
+ui_line() { printf '%s\n' "${C_FRM}${UI_RULE}${C_RST}"; }   # ═══ frame line
+ui_sep()  { printf '%s\n' "${C_FRM}${UI_SEP}${C_RST}"; }    # --- group separator
+ui_thin() { printf '%s\n' "${C_FRM}${UI_THIN}${C_RST}"; }   # ─── under status lines
 # ui_center TEXT [COLOR] - centre plain TEXT in the screen width.
 ui_center() {
     local pad=$(( (UI_W - ${#1}) / 2 ))
     (( pad < 0 )) && pad=0
     printf '%*s%s\n' "$pad" '' "${2:-}$1${2:+$C_RST}"
 }
-ui_title() { ui_line; ui_center "$*" "$C_YLW"; ui_line; }
-ui_item()  { printf ' %s%s%s %s\n' "$C_GRN" "[$(printf '%2s' "$1")]" "$C_CYN$UI_ARROW$C_RST" "$2"; }
-# ui_kv LABEL VALUE - aligned "label: value" line.
-ui_kv()    { printf '  %s%-15s%s %s\n' "$C_CYN" "$1" "$C_RST" "$2"; }
-ui_pause() { [[ -t 0 ]] || return 0; printf '\n'; read -r -s -n 1 -p "  Press any key to continue..." _ || true; printf '\n'; }
+ui_title() { ui_line; ui_center "$*" "$C_WHT"; ui_line; }
+# ui_item N LABEL - "  [1]> LABEL"; two-digit numbers start one column left.
+ui_item() {
+    local pad='  '
+    (( ${#1} > 1 )) && pad=' '
+    printf '%s%s%s%s>%s %s%s%s\n' "$pad" "$C_GRN" "[$1]" "$C_RED" "$C_RST" "$C_WHT" "$2" "$C_RST"
+}
+# ui_kv LABEL VALUE - aligned status line.
+ui_kv()    { printf ' %s%-15s%s %s\n' "$C_GRN" "$1" "$C_RST" "$2"; }
+ui_pause() {
+    [[ -t 0 ]] || return 0
+    ui_line
+    ui_center ">> Press Enter to continue <<" "$C_YLW"
+    read -r _ || true
+}
+# ui_step TEXT STATUS - "           systemctl restart x..........OK"
+ui_step() {
+    local text=${1:0:36} st=$2 col=$C_GRN n
+    [[ $st == OK ]] || col=$C_RED
+    n=$(( 38 - ${#text} )); (( n < 1 )) && n=1
+    printf '           %s%s%s%s%s\n' "$C_WHT" "$text" "$(printf '%*s' "$n" '' | tr ' ' '.')" "$col$st" "$C_RST"
+}
+# run_step TEXT CMD... - run CMD quietly and report it with ui_step.
+run_step() {
+    local text=$1; shift
+    if "$@" > /dev/null 2>&1; then ui_step "$text" OK; return 0; fi
+    ui_step "$text" Failed; return 1
+}
 
 # ask VAR "Prompt" [default] - read a line into VAR.
 ask() {
@@ -132,13 +178,13 @@ log_event() {
 }
 
 # ------------------------------------------------------------ validation ---
-# Usernames: lowercase letter or underscore first, 3-32 chars total.
-valid_username() { [[ $1 =~ ^[a-z_][a-z0-9_-]{2,31}$ ]]; }
+# Usernames: lowercase letter or underscore first, 2-32 chars total.
+valid_username() { [[ $1 =~ ^[a-z_][a-z0-9_-]{1,31}$ ]]; }
 
-# Passwords: 4-64 printable characters, no whitespace or colons.
+# Passwords: 3-64 printable characters, no whitespace or colons.
 valid_password() {
     local p=$1
-    (( ${#p} >= 4 && ${#p} <= 64 )) || return 1
+    (( ${#p} >= 3 && ${#p} <= 64 )) || return 1
     [[ $p =~ ^[[:graph:]]+$ ]] || return 1
     [[ $p != *:* ]]
 }
@@ -211,8 +257,9 @@ expiry_from_days() {
 }
 
 expiry_from_hours() { printf '%s\n' $(( $(now_epoch) + $1 * 3600 )); }
+expiry_from_minutes() { printf '%s\n' $(( $(now_epoch) + $1 * 60 )); }
 
-fmt_date() { date -d "@$1" '+%Y-%m-%d %H:%M'; }
+fmt_date() { if [[ ${LOCAL_TIME:-1} == 1 ]]; then date -d "@$1" "+%Y-%m-%d %H:%M"; else TZ=UTC date -d "@$1" "+%Y-%m-%d %H:%M UTC"; fi; }
 
 # Whole days remaining (rounded up), 0 when expired.
 days_left() {

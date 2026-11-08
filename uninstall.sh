@@ -3,6 +3,7 @@
 #
 # Always removed: the panel files, its commands, the guard timer and every
 # service the panel created (Dropbear unit, proxies, Stunnel, Xray, Hysteria2,
+# SlowDNS, BadVPN, Checkuser, OpenVPN, DDoS rules,
 # WireGuard server created by the panel, blocking rules, Squid configuration,
 # Fail2ban jail).
 # Kept unless you choose otherwise: panel accounts and /etc/vpspanel.
@@ -43,6 +44,12 @@ stn_installed && stn_uninstall
 [[ -f $XRAY_UNIT ]] && xray_uninstall
 [[ -f $HY_UNIT ]] && hy_uninstall
 wg_installed && wg_uninstall
+sdns_installed && sdns_uninstall
+bv_installed && bv_uninstall
+cu_installed && cu_uninstall
+ovpn_installed && ovpn_uninstall
+ddos_installed && ddos_uninstall
+[[ -f $AUTHD_UNIT ]] && { systemctl disable --now vpspanel-authd > /dev/null 2>&1; rm -f "$AUTHD_UNIT"; }
 fwb_remove; rm -rf "$FWB_DIR"; [[ -f $FWB_UNIT ]] && { systemctl disable vpspanel-firewall > /dev/null 2>&1; rm -f "$FWB_UNIT"; }
 squid_installed && squid_uninstall
 if [[ -f $F2B_JAIL ]]; then rm -f "$F2B_JAIL"; systemctl try-restart fail2ban > /dev/null 2>&1; fi
@@ -69,6 +76,7 @@ for c in menu vpspanel; do
     [[ -e /usr/local/bin/$c.before-vpspanel ]] && mv "/usr/local/bin/$c.before-vpspanel" "/usr/local/bin/$c"
 done
 systemctl daemon-reload
+systemctl reset-failed "vpspanel-*" > /dev/null 2>&1 || true
 log_event "panel uninstalled"
 [[ $HERE == /opt/vpspanel ]] && rm -rf /opt/vpspanel
 ok "VPSPanel was uninstalled. SSH ports and root-login settings were not changed."
