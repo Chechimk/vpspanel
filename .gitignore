@@ -1,0 +1,49 @@
+# Secrets and credentials
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+*.secret
+secrets/
+credentials*
+.netrc
+
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+panel.conf
+*.local
+*.local.conf
+
+# Panel runtime data (account database, password-hash backups)
+accounts.db
+accounts.db.*
+shadow
+vpspanel-backup-*.tar.gz
+*.tar.gz
+banner.txt
+dropbear.port
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+*.bak
+tmp/
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

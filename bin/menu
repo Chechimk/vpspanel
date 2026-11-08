@@ -1,0 +1,316 @@
+#!/bin/bash
+# vpspanel - interactive administration menu.
+set -uo pipefail
+
+VPSP_HOME=${VPSP_HOME:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)}
+# shellcheck source=../lib/common.sh
+. "$VPSP_HOME/lib/common.sh"
+# shellcheck source=../lib/accounts.sh
+. "$VPSP_HOME/lib/accounts.sh"
+# shellcheck source=../lib/system.sh
+. "$VPSP_HOME/lib/system.sh"
+for m in "$VPSP_HOME"/modules/*.sh; do
+    # shellcheck source=/dev/null
+    [[ -r $m ]] && . "$m"
+done
+load_config
+require_root
+[[ -t 0 ]] || die "menu is interactive; use the 'vpspanel' command in scripts."
+
+CLI="$VPSP_HOME/bin/vpspanel"
+
+# ------------------------------------------------------------- dashboard ---
+header() {
+    local active=0 expired=0 locked=0 online=0 u
+    for u in $(db_users); do
+        acct_os_exists "$u" || continue
+        case $(acct_status "$u") in
+            ACTIVE) active=$((active+1)) ;; EXPIRED) expired=$((expired+1)) ;; LOCKED) locked=$((locked+1)) ;;
+        esac
+        (( $(acct_sessions "$u") > 0 )) && online=$((online+1))
+    done
+    clear
+    ui_line
+    printf '  %s%s%s  v%s\n' "$C_BLD" "VPS PANEL" "$C_RST" "$VPSP_VERSION"
+    ui_line
+    printf '  %-8s %s\n' "OS:" "$(sys_os)"
+    printf '  %-8s %-18s %-8s %s\n' "IP:" "$(sys_ip)" "Date:" "$(date '+%F %H:%M')"
+    printf '  %-8s %-18s %-8s %s\n' "RAM:" "$(sys_ram)" "Cores:" "$(sys_cores)"
+    printf '  %-8s %-18s %-8s %s\n' "Disk:" "$(sys_disk)" "Load:" "$(sys_load)"
+    ui_line
+    printf '  Accounts  %sactive %d%s  %sexpired %d%s  %slocked %d%s  online %d\n' \
+        "$C_GRN" "$active" "$C_RST" "$C_RED" "$expired" "$C_RST" "$C_YLW" "$locked" "$C_RST" "$online"
+    ui_line
+}
+
+# Prompt for an existing panel account, offering the list first.
+pick_account() {
+    local __var=$1 users name
+    users=$(db_users)
+    [[ -n $users ]] || { warn "There are no accounts yet."; return 1; }
+    printf '  Accounts: %s\n' "$(echo $users)"
+    ask name "Username" || return 1
+    [[ -n $name ]] || return 1
+    acct_is_panel "$name" || { err "No account named '$name'."; return 1; }
+    printf -v "$__var" '%s' "$name"
+}
+
+# ---------------------------------------------------------- account menu ---
+account_create() {
+    local user pass days limit
+    ui_title "Create account"
+    ask user "Username" || return
+    valid_username "$user" || { err "Use 3-32 lowercase letters, digits, '_' or '-', starting with a letter."; return; }
+    acct_os_exists "$user" && { err "User '$user' already exists."; return; }
+    ask pass "Password" || return
+    ask days "Valid for (days)" "$DEFAULT_DAYS" || return
+    ask limit "Max simultaneous logins (0 = unlimited)" "$DEFAULT_LIMIT" || return
+    "$CLI" create "$user" "$pass" "$days" "$limit" || return
+    account_summary "$user" "$pass"
+}
+
+account_trial() {
+    local user pass hours
+    ui_title "Create trial account"
+    user="trial$(tr -dc 'a-z0-9' < /dev/urandom | head -c 4)"
+    pass="$(tr -dc 'a-z0-9' < /dev/urandom | head -c 6)"
+    ask user "Username" "$user" || return
+    ask pass "Password" "$pass" || return
+    ask hours "Valid for (hours)" "2" || return
+    "$CLI" trial "$user" "$pass" "$hours" 1 || return
+    account_summary "$user" "$pass"
+}
+
+# Connection details to hand to the customer.
+account_summary() {
+    local user=$1 pass=$2 port
+    ui_line
+    printf '  %-12s %s\n' "Host/IP:" "$(sys_ip)"
+    printf '  %-12s %s\n' "Username:" "$user"
+    printf '  %-12s %s\n' "Password:" "$pass"
+    printf '  %-12s %s\n' "Expires:" "$(fmt_date "$(db_field "$user" 2)")"
+    printf '  %-12s %s\n' "Logins:" "$(db_field "$user" 3)"
+    port=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | paste -sd, -)
+    printf '  %-12s %s\n' "SSH port:" "${port:-22}"
+    if declare -F dropbear_installed > /dev/null && dropbear_installed; then
+        printf '  %-12s %s\n' "Dropbear:" "$(dropbear_port)"
+    fi
+    ui_line
+    warn "The panel does not store passwords. Save these details now."
+}
+
+account_delete() {
+    local u; ui_title "Delete account"
+    pick_account u || return
+    confirm "Delete '$u' and close its sessions?" && "$CLI" delete "$u"
+}
+
+account_renew() {
+    local u days; ui_title "Renew account"
+    pick_account u || return
+    printf '  Current expiry: %s\n' "$(fmt_date "$(db_field "$u" 2)")"
+    ask days "Add days" "$DEFAULT_DAYS" || return
+    "$CLI" renew "$u" "$days"
+}
+
+account_password() {
+    local u p; ui_title "Change password"
+    pick_account u || return
+    ask p "New password" || return
+    "$CLI" passwd "$u" "$p"
+}
+
+account_limit() {
+    local u n; ui_title "Change login limit"
+    pick_account u || return
+    printf '  Current limit: %s\n' "$(db_field "$u" 3)"
+    ask n "New limit (0 = unlimited)" || return
+    "$CLI" limit "$u" "$n"
+}
+
+account_lock_toggle() {
+    local u; ui_title "Lock / unlock account"
+    pick_account u || return
+    if acct_is_locked "$u"; then
+        confirm "'$u' is locked. Unlock it?" && "$CLI" unlock "$u"
+    else
+        confirm "Lock '$u' and close its sessions?" && "$CLI" lock "$u"
+    fi
+}
+
+account_monitor() {
+    local key
+    while true; do
+        clear
+        ui_title "Online monitor  (refreshes every 3s, press any key to exit)"
+        "$CLI" online
+        read -r -s -n 1 -t 3 key && break
+    done
+}
+
+account_backup_menu() {
+    local c f
+    ui_title "Backup / restore"
+    ui_item 1 "Create backup"
+    ui_item 2 "Restore from backup"
+    ui_item 0 "Back"
+    ask c "Option" || return
+    case $c in
+        1) "$CLI" backup ;;
+        2) ask f "Backup file path" || return; "$CLI" restore "$f" ;;
+    esac
+}
+
+accounts_menu() {
+    local c
+    while true; do
+        header
+        printf '  %sACCOUNT MANAGER%s\n' "$C_BLD" "$C_RST"
+        ui_item 1  "Create account"
+        ui_item 2  "Create trial account"
+        ui_item 3  "Delete account"
+        ui_item 4  "Renew account"
+        ui_item 5  "Change password"
+        ui_item 6  "Change login limit"
+        ui_item 7  "Lock / unlock account"
+        ui_item 8  "Account details"
+        ui_item 9  "List accounts"
+        ui_item 10 "Online monitor"
+        ui_item 11 "Delete all expired accounts"
+        ui_item 12 "Backup / restore"
+        ui_item 13 "Repair accounts"
+        ui_item 0  "Back"
+        ui_line
+        ask c "Option" || return
+        case $c in
+            1)  account_create; ui_pause ;;
+            2)  account_trial; ui_pause ;;
+            3)  account_delete; ui_pause ;;
+            4)  account_renew; ui_pause ;;
+            5)  account_password; ui_pause ;;
+            6)  account_limit; ui_pause ;;
+            7)  account_lock_toggle; ui_pause ;;
+            8)  local u; pick_account u && "$CLI" info "$u"; ui_pause ;;
+            9)  "$CLI" list; ui_pause ;;
+            10) account_monitor ;;
+            11) confirm "Delete every expired account?" && "$CLI" purge-expired; ui_pause ;;
+            12) account_backup_menu; ui_pause ;;
+            13) "$CLI" repair; ui_pause ;;
+            0)  return ;;
+        esac
+    done
+}
+
+# --------------------------------------------------------- protocols menu ---
+protocols_menu() {
+    local c entry unit label
+    while true; do
+        header
+        printf '  %sPROTOCOLS & SERVICES%s\n' "$C_BLD" "$C_RST"
+        for entry in "${VPSP_SERVICES[@]}"; do
+            unit=${entry%%|*}; label=${entry#*|}
+            printf '    %-16s %s\n' "$label" "$(svc_state_any "$unit")"
+        done
+        ui_line
+        ui_item 1 "Dropbear"
+        ui_item 2 "Restart all panel services"
+        printf '  %s\n' "${C_DIM}Xray, WireGuard, OpenVPN, Hysteria2 and SlowDNS modules are planned.${C_RST}"
+        printf '  %s\n' "${C_DIM}See docs/ROADMAP.md.${C_RST}"
+        ui_item 0 "Back"
+        ui_line
+        ask c "Option" || return
+        case $c in
+            1) dropbear_menu ;;
+            2) for entry in "${VPSP_SERVICES[@]}"; do
+                   unit=${entry%%|*}
+                   [[ $(svc_state_any "$unit") == active ]] && systemctl restart "$unit" && ok "Restarted ${entry#*|}"
+               done
+               ui_pause ;;
+            0) return ;;
+        esac
+    done
+}
+
+# ------------------------------------------------------------ system menu ---
+system_menu() {
+    local c tz
+    while true; do
+        header
+        printf '  %sSYSTEM TOOLS%s\n' "$C_BLD" "$C_RST"
+        printf '    Kernel %s   Uptime %s\n' "$(sys_kernel)" "$(sys_uptime)"
+        printf '    BBR: %s   Timezone: %s\n' "$(bbr_enabled && echo on || echo off)" "$(tz_current)"
+        ui_line
+        ui_item 1 "Toggle BBR congestion control"
+        ui_item 2 "Set timezone"
+        ui_item 3 "Show panel log"
+        ui_item 4 "Update system packages"
+        ui_item 5 "Reboot server"
+        ui_item 0 "Back"
+        ui_line
+        ask c "Option" || return
+        case $c in
+            1) if bbr_enabled; then bbr_disable && ok "BBR disabled."; else bbr_enable && ok "BBR enabled."; fi; ui_pause ;;
+            2) ask tz "Timezone (e.g. Europe/London, America/New_York)" "$(tz_current)" && tz_set "$tz" && ok "Timezone set."; ui_pause ;;
+            3) tail -n 40 "$VPSP_LOG" 2>/dev/null || info "The log is empty."; ui_pause ;;
+            4) confirm "Run apt-get update and upgrade now?" && apt-get update && apt-get upgrade -y; ui_pause ;;
+            5) confirm "Reboot the server now?" && reboot ;;
+            0) return ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------- settings menu ---
+settings_menu() {
+    local c v
+    while true; do
+        header
+        printf '  %sPANEL SETTINGS%s\n' "$C_BLD" "$C_RST"
+        printf '    Default days: %s   Default login limit: %s\n' "$DEFAULT_DAYS" "$DEFAULT_LIMIT"
+        printf '    Auto-delete expired after: %s\n' "$( (( AUTO_DELETE_DAYS > 0 )) && echo "$AUTO_DELETE_DAYS day(s)" || echo never)"
+        printf '    SSH banner: %s\n' "$( [[ -n $BANNER_TEXT ]] && echo set || echo none)"
+        ui_line
+        ui_item 1 "Default validity (days)"
+        ui_item 2 "Default login limit"
+        ui_item 3 "Auto-delete expired accounts"
+        ui_item 4 "SSH login banner"
+        ui_item 5 "Update panel"
+        ui_item 6 "Uninstall panel"
+        ui_item 0 "Back"
+        ui_line
+        ask c "Option" || return
+        case $c in
+            1) ask v "Days" "$DEFAULT_DAYS" && { valid_int "$v" 1 3650 && set_config DEFAULT_DAYS "$v" && ok "Saved." || err "Enter 1-3650."; }; ui_pause ;;
+            2) ask v "Logins (0 = unlimited)" "$DEFAULT_LIMIT" && { valid_int "$v" 0 999 && set_config DEFAULT_LIMIT "$v" && ok "Saved." || err "Enter 0-999."; }; ui_pause ;;
+            3) ask v "Delete accounts this many days after expiry (0 = never)" "$AUTO_DELETE_DAYS" && { valid_int "$v" 0 3650 && set_config AUTO_DELETE_DAYS "$v" && ok "Saved." || err "Enter 0-3650."; }; ui_pause ;;
+            4) info "Use \\n for new lines. Leave empty to remove the banner."
+               ask v "Banner text" || continue
+               banner_apply "$v" && ok "Banner updated."; ui_pause ;;
+            5) "$VPSP_HOME/update.sh"; ui_pause ;;
+            6) if confirm "Uninstall the panel? Accounts are kept unless you choose otherwise."; then
+                   "$VPSP_HOME/uninstall.sh" && exit 0
+               fi
+               ui_pause ;;
+            0) return ;;
+        esac
+    done
+}
+
+# --------------------------------------------------------------- main menu ---
+while true; do
+    header
+    printf '  %sMAIN MENU%s\n' "$C_BLD" "$C_RST"
+    ui_item 1 "Account manager"
+    ui_item 2 "Protocols & services"
+    ui_item 3 "System tools"
+    ui_item 4 "Panel settings"
+    ui_item 0 "Exit"
+    ui_line
+    ask choice "Option" || exit 0
+    case $choice in
+        1) accounts_menu ;;
+        2) protocols_menu ;;
+        3) system_menu ;;
+        4) settings_menu ;;
+        0|q|exit) clear; exit 0 ;;
+    esac
+done

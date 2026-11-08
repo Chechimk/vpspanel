@@ -1,0 +1,135 @@
+#!/bin/bash
+# vpspanel - command-line interface. The interactive `menu` and the
+# vpspanel-guard timer use the same library functions.
+set -uo pipefail
+
+VPSP_HOME=${VPSP_HOME:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)}
+# shellcheck source=../lib/common.sh
+. "$VPSP_HOME/lib/common.sh"
+# shellcheck source=../lib/accounts.sh
+. "$VPSP_HOME/lib/accounts.sh"
+# shellcheck source=../lib/system.sh
+. "$VPSP_HOME/lib/system.sh"
+load_config
+
+usage() {
+    cat <<USAGE
+vpspanel $VPSP_VERSION - VPS account administration
+
+Usage: vpspanel <command> [arguments]
+
+Accounts
+  create  USER PASS DAYS [LIMIT]    Create an account valid for DAYS days
+  trial   USER PASS HOURS [LIMIT]   Create a trial account valid for HOURS hours
+  delete  USER                      Delete an account and close its sessions
+  renew   USER DAYS                 Extend an account by DAYS days
+  passwd  USER PASS                 Change an account password
+  limit   USER N                    Set max simultaneous logins (0 = unlimited)
+  lock    USER                      Lock an account and close its sessions
+  unlock  USER                      Unlock an account
+  info    USER                      Show one account
+  list                              List all accounts
+  online                            Show accounts with open sessions
+  purge-expired                     Delete all expired accounts
+  repair                            Drop records of users removed outside the panel
+
+Maintenance
+  enforce                           Apply expiry and login limits (run by the guard timer)
+  backup  [FILE]                    Back up accounts (default /root/vpspanel-backup-DATE.tar.gz)
+  restore FILE                      Restore accounts from a backup
+  version                           Print the version
+
+Run \`menu\` for the interactive panel.
+USAGE
+}
+
+need() { (( $1 >= $2 )) || { usage >&2; exit 2; }; }
+
+print_list() {
+    local u st exp days limit on total=0
+    printf '%-18s %-8s %-17s %5s %5s %6s\n' USER STATUS EXPIRES DAYS LIMIT ONLINE
+    for u in $(db_users); do
+        acct_os_exists "$u" || { printf '%-18s %s\n' "$u" "MISSING (run repair)"; continue; }
+        st=$(acct_status "$u"); exp=$(db_field "$u" 2); limit=$(db_field "$u" 3)
+        days=$(days_left "$exp"); on=$(acct_sessions "$u")
+        [[ $limit == 0 ]] && limit="-"
+        [[ $(db_field "$u" 5) == trial ]] && days="${days}T"
+        case $st in
+            ACTIVE)  st="${C_GRN}ACTIVE ${C_RST}" ;;
+            EXPIRED) st="${C_RED}EXPIRED${C_RST}" ;;
+            LOCKED)  st="${C_YLW}LOCKED ${C_RST}" ;;
+        esac
+        printf '%-18s %s  %-17s %5s %5s %6s\n' "$u" "$st" "$(fmt_date "$exp")" "$days" "$limit" "$on"
+        total=$((total + 1))
+    done
+    printf '\n%d account(s). T = trial.\n' "$total"
+}
+
+print_online() {
+    local u n limit any=0
+    printf '%-18s %8s %6s\n' USER SESSIONS LIMIT
+    for u in $(db_users); do
+        acct_os_exists "$u" || continue
+        n=$(acct_sessions "$u")
+        (( n > 0 )) || continue
+        limit=$(db_field "$u" 3); [[ $limit == 0 ]] && limit="-"
+        printf '%-18s %8s %6s\n' "$u" "$n" "$limit"
+        any=1
+    done
+    (( any )) || echo "No accounts are connected."
+}
+
+print_info() {
+    local u=$1 exp
+    _need_account "$u" || return 1
+    exp=$(db_field "$u" 2)
+    printf 'User:        %s\n' "$u"
+    printf 'Type:        %s\n' "$(db_field "$u" 5)"
+    printf 'Status:      %s\n' "$(acct_status "$u")"
+    printf 'Created:     %s\n' "$(fmt_date "$(db_field "$u" 4)")"
+    printf 'Expires:     %s (%s day(s) left)\n' "$(fmt_date "$exp")" "$(days_left "$exp")"
+    printf 'Login limit: %s\n' "$(db_field "$u" 3)"
+    printf 'Online:      %s\n' "$(acct_sessions "$u")"
+}
+
+cmd=${1:-help}; shift || true
+case $cmd in
+    help|-h|--help) usage; exit 0 ;;
+    version|--version) echo "$VPSP_VERSION"; exit 0 ;;
+esac
+
+require_root
+
+case $cmd in
+    create)
+        need $# 3
+        valid_int "$3" 1 3650 || die "Days must be 1-3650."
+        acct_create "$1" "$2" "$(expiry_from_days "$3")" "${4:-$DEFAULT_LIMIT}" normal \
+            && ok "Created '$1', expires $(fmt_date "$(db_field "$1" 2)")." ;;
+    trial)
+        need $# 3
+        valid_int "$3" 1 168 || die "Trial hours must be 1-168."
+        acct_create "$1" "$2" "$(expiry_from_hours "$3")" "${4:-1}" trial \
+            && ok "Created trial '$1', expires $(fmt_date "$(db_field "$1" 2)")." ;;
+    delete)  need $# 1; acct_delete "$1" && ok "Deleted '$1'." ;;
+    renew)   need $# 2; acct_renew "$1" "$2" && ok "Renewed '$1' until $(fmt_date "$(db_field "$1" 2)")." ;;
+    passwd)  need $# 2; acct_set_password "$1" "$2" && ok "Password changed for '$1'." ;;
+    limit)   need $# 2; acct_set_limit "$1" "$2" && ok "Login limit for '$1' set to $2." ;;
+    lock)    need $# 1; acct_lock "$1" && ok "Locked '$1'." ;;
+    unlock)  need $# 1; acct_unlock "$1" && ok "Unlocked '$1'." ;;
+    info)    need $# 1; print_info "$1" ;;
+    list)    print_list ;;
+    online)  print_online ;;
+    purge-expired)
+        removed=$(acct_purge_expired)
+        if [[ -n $removed ]]; then printf 'Deleted: %s\n' $removed; else echo "No expired accounts."; fi ;;
+    repair)
+        removed=$(acct_repair)
+        if [[ -n $removed ]]; then printf 'Dropped: %s\n' $removed; else echo "Nothing to repair."; fi ;;
+    enforce) acct_enforce ;;
+    backup)
+        file=${1:-/root/vpspanel-backup-$(date +%Y%m%d-%H%M%S).tar.gz}
+        acct_backup "$file" && ok "Backup written to $file" ;;
+    restore) need $# 1; acct_restore "$1" ;;
+    *) err "Unknown command: $cmd"; usage >&2; exit 2 ;;
+esac
