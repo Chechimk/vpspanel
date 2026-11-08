@@ -16,6 +16,26 @@ codebase is original. It is English-only and needs no activation key.
 > changes nothing. Try VPSPanel on a test server before using it in
 > production.
 
+## One-Command Installation
+
+Log in to your Ubuntu 20.04+ or Debian 11+ server over SSH and run:
+
+```bash
+sudo apt-get update -y && sudo apt-get install -y curl && curl -fsSLo vpspanel-install.sh https://raw.githubusercontent.com/Chechimk/vpspanel/main/quick-install.sh && sudo bash vpspanel-install.sh
+```
+
+Then open the panel with `menu`. No activation key is needed.
+
+[`quick-install.sh`](quick-install.sh) installs git, downloads the latest
+`main` branch into a temporary folder and runs `install.sh` from it (see
+"Install" below for what that changes). It stops with a clear message, and
+without changing anything, if the system is unsupported or the download
+fails. If VPSPanel is already installed, it asks before updating it (accounts
+and settings are always kept); add `--update` to update without being asked.
+
+If you are logged in as root on a system without `sudo`, run the same command
+with every `sudo ` removed.
+
 ## Install
 
 ```bash

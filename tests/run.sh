@@ -18,13 +18,13 @@ static_tests() {
     section "Static checks"
     local f
     for f in "$ROOT"/bin/menu "$ROOT"/bin/vpspanel "$ROOT"/bin/vpspanel-dropbear "$ROOT"/lib/*.sh "$ROOT"/modules/*.sh \
-             "$ROOT"/install.sh "$ROOT"/update.sh "$ROOT"/uninstall.sh "$ROOT"/tests/run.sh; do
+             "$ROOT"/install.sh "$ROOT"/quick-install.sh "$ROOT"/update.sh "$ROOT"/uninstall.sh "$ROOT"/tests/run.sh; do
         check "bash -n ${f#"$ROOT"/}" bash -n "$f"
     done
     check "python3 compiles bin/vpspanel-wsproxy" python3 -m py_compile "$ROOT/bin/vpspanel-wsproxy"
     if command -v shellcheck > /dev/null; then
         check "shellcheck (errors only)" shellcheck -S error -x "$ROOT"/bin/menu "$ROOT"/bin/vpspanel "$ROOT"/lib/*.sh \
-            "$ROOT"/modules/*.sh "$ROOT"/install.sh "$ROOT"/update.sh "$ROOT"/uninstall.sh
+            "$ROOT"/modules/*.sh "$ROOT"/install.sh "$ROOT"/quick-install.sh "$ROOT"/update.sh "$ROOT"/uninstall.sh
     fi
     check "no files referenced by the menu are missing" missing_files
 }

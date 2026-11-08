@@ -56,8 +56,8 @@ for p in "${pkgs[@]}"; do
 done
 if (( ${#missing[@]} )); then
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -q > /dev/null || warn "apt-get update reported problems; continuing."
-    apt-get install -y -q --no-install-recommends "${missing[@]}" > /dev/null \
+    apt-get -o DPkg::Lock::Timeout=300 update -q > /dev/null || warn "apt-get update reported problems; continuing."
+    apt-get -o DPkg::Lock::Timeout=300 install -y -q --no-install-recommends "${missing[@]}" > /dev/null \
         || die "Could not install: ${missing[*]}"
     ok "Installed: ${missing[*]}"
 else
