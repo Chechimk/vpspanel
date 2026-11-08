@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""vpspanel WebSocket / HTTP proxy.
+
+Accepts a connection, reads the HTTP request (or several, for clients that
+send a split payload), answers with a "101 Switching Protocols" style status
+line, then relays raw bytes to a local port (normally SSH or Dropbear).
+
+Usage: vpspanel-wsproxy --port 80 --target 22 [--status "Switching Protocols"]
+"""
+import argparse
+import asyncio
+import logging
+import re
+import signal
+
+MAX_HEADER = 16 * 1024          # bytes of request headers we are willing to read
+HEADER_TIMEOUT = 10             # seconds to wait for the request headers
+CHUNK = 64 * 1024
+METHOD = re.compile(rb"^[A-Z]{3,10} \S+ HTTP/1\.[01]\r?\n")
+
+log = logging.getLogger("wsproxy")
+
+
+async def read_headers(reader: asyncio.StreamReader, buf: bytes) -> bytes:
+    """Consume HTTP request blocks at the start of the stream.
+
+    Returns the bytes received after the last header block.
+    """
+    while True:
+        if not METHOD.match(buf):
+            # Not (or no longer) an HTTP request: stop if we already have data.
+            if buf:
+                return buf
+        end = buf.find(b"\r\n\r\n")
+        if end >= 0 and METHOD.match(buf):
+            buf = buf[end + 4:]
+            if not buf:
+                # Some clients send a second request only after a short pause.
+                try:
+                    buf = await asyncio.wait_for(reader.read(CHUNK), timeout=0.3)
+                except asyncio.TimeoutError:
+                    return b""
+                if not buf:
+                    return b""
+            continue
+        if len(buf) > MAX_HEADER:
+            raise ValueError("request headers too large")
+        data = await asyncio.wait_for(reader.read(CHUNK), timeout=HEADER_TIMEOUT)
+        if not data:
+            raise ConnectionError("client closed before sending headers")
+        buf += data
+
+
+async def pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
+    try:
+        while True:
+            data = await src.read(CHUNK)
+            if not data:
+                break
+            dst.write(data)
+            await dst.drain()
+    except (ConnectionError, asyncio.CancelledError):
+        pass
+    finally:
+        try:
+            dst.close()
+        except Exception:  # noqa: BLE001 - socket already gone
+            pass
+
+
+async def handle(reader, writer, target: int, status: bytes) -> None:
+    peer = writer.get_extra_info("peername")
+    try:
+        first = await asyncio.wait_for(reader.read(CHUNK), timeout=HEADER_TIMEOUT)
+        rest = await read_headers(reader, first)
+        writer.write(b"HTTP/1.1 101 " + status + b"\r\n\r\n")
+        await writer.drain()
+        up_reader, up_writer = await asyncio.open_connection("127.0.0.1", target)
+        if rest:
+            up_writer.write(rest)
+            await up_writer.drain()
+        await asyncio.gather(pipe(reader, up_writer), pipe(up_reader, writer))
+    except (asyncio.TimeoutError, ConnectionError, ValueError, OSError) as exc:
+        log.info("%s: %s", peer, exc)
+    finally:
+        try:
+            writer.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--port", type=int, required=True, help="listening port")
+    ap.add_argument("--target", type=int, required=True, help="local port to relay to")
+    ap.add_argument("--status", default="Switching Protocols", help="text after the 101 status code")
+    ap.add_argument("--listen", default="0.0.0.0", help="listening address")
+    args = ap.parse_args()
+    status = re.sub(r"[\r\n]", "", args.status).encode()[:120] or b"Switching Protocols"
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    server = await asyncio.start_server(
+        lambda r, w: handle(r, w, args.target, status), args.listen, args.port, reuse_address=True)
+    log.info("listening on %s:%d, relaying to 127.0.0.1:%d", args.listen, args.port, args.target)
+
+    stop = asyncio.get_running_loop().create_future()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        asyncio.get_running_loop().add_signal_handler(sig, stop.set_result, None)
+    async with server:
+        await stop
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

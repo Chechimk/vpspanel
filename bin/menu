@@ -1,48 +1,72 @@
 #!/bin/bash
 # vpspanel - interactive administration menu.
+# Every screen is drawn by menu_show (lib/ui.sh): 0 = Back, x = Exit panel.
 set -uo pipefail
 
-VPSP_HOME=${VPSP_HOME:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)}
+VPSP_HOME=${VPSP_HOME:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}
 # shellcheck source=../lib/common.sh
 . "$VPSP_HOME/lib/common.sh"
 # shellcheck source=../lib/accounts.sh
 . "$VPSP_HOME/lib/accounts.sh"
 # shellcheck source=../lib/system.sh
 . "$VPSP_HOME/lib/system.sh"
+# shellcheck source=../lib/ui.sh
+. "$VPSP_HOME/lib/ui.sh"
 for m in "$VPSP_HOME"/modules/*.sh; do
     # shellcheck source=/dev/null
     [[ -r $m ]] && . "$m"
 done
 load_config
-require_root
-[[ -t 0 ]] || die "menu is interactive; use the 'vpspanel' command in scripts."
+# VPSP_MENU_LIB=1 loads the functions without starting the panel (test suite).
+if [[ ${VPSP_MENU_LIB:-0} != 1 ]]; then
+    require_root
+    [[ -t 0 ]] || die "menu is interactive; use the 'vpspanel' command in scripts."
+fi
 
 CLI="$VPSP_HOME/bin/vpspanel"
 
-# ------------------------------------------------------------- dashboard ---
-header() {
-    local active=0 expired=0 locked=0 online=0 u
+# ============================================================= dashboard ===
+account_counts() {
+    local active=0 expired=0 locked=0 online=0 total=0 u
     for u in $(db_users); do
         acct_os_exists "$u" || continue
+        total=$((total + 1))
         case $(acct_status "$u") in
-            ACTIVE) active=$((active+1)) ;; EXPIRED) expired=$((expired+1)) ;; LOCKED) locked=$((locked+1)) ;;
+            ACTIVE) active=$((active + 1)) ;; EXPIRED) expired=$((expired + 1)) ;; LOCKED) locked=$((locked + 1)) ;;
         esac
-        (( $(acct_sessions "$u") > 0 )) && online=$((online+1))
+        (( $(acct_sessions "$u") > 0 )) && online=$((online + 1))
     done
-    clear
-    ui_line
-    printf '  %s%s%s  v%s\n' "$C_BLD" "VPS PANEL" "$C_RST" "$VPSP_VERSION"
-    ui_line
-    printf '  %-8s %s\n' "OS:" "$(sys_os)"
-    printf '  %-8s %-18s %-8s %s\n' "IP:" "$(sys_ip)" "Date:" "$(date '+%F %H:%M')"
-    printf '  %-8s %-18s %-8s %s\n' "RAM:" "$(sys_ram)" "Cores:" "$(sys_cores)"
-    printf '  %-8s %-18s %-8s %s\n' "Disk:" "$(sys_disk)" "Load:" "$(sys_load)"
-    ui_line
-    printf '  Accounts  %sactive %d%s  %sexpired %d%s  %slocked %d%s  online %d\n' \
-        "$C_GRN" "$active" "$C_RST" "$C_RED" "$expired" "$C_RST" "$C_YLW" "$locked" "$C_RST" "$online"
-    ui_line
+    echo "$active $expired $locked $total $online"
 }
 
+# two-column line: "label value      label value"
+dash_row() {
+    local half=$(( UI_W / 2 - 1 ))
+    printf ' %s%-7s%s%-*s %s%-7s%s%s\n' "$C_CYN" "$1" "$C_RST" "$(( half - 8 ))" "$2" "$C_CYN" "${3:-}" "$C_RST" "${4:-}"
+}
+
+dashboard() {
+    local c used total free cache
+    read -r -a c < <(account_counts)
+    total=$(meminfo_mb MemTotal); free=$(meminfo_mb MemAvailable)
+    cache=$(( $(meminfo_mb Cached) + $(meminfo_mb Buffers) ))
+    used=$(( total - free ))
+    ui_line
+    ui_center "VPS PANEL  v$VPSP_VERSION" "$C_BLD$C_GRN"
+    ui_line
+    dash_row "OS:" "$(sys_os | cut -c1-$(( UI_W / 2 - 10 )))" "Host:" "$(sys_hostname | cut -c1-18)"
+    dash_row "IP:" "$(sys_ip)" "Date:" "$(date '+%F %H:%M')"
+    dash_row "RAM:" "${total} MB" "Used:" "${used} MB ($(( total ? used * 100 / total : 0 ))%)"
+    dash_row "Free:" "${free} MB" "Cache:" "${cache} MB"
+    dash_row "Swap:" "$(sys_swap)" "Disk:" "$(sys_disk)"
+    dash_row "CPU:" "$(sys_cores) core(s) $(sys_cpu_pct)%" "Load:" "$(sys_load)"
+    ui_line
+    printf ' %sACTIVE%s %-4s %sEXPIRED%s %-4s %sLOCKED%s %-4s %sTOTAL%s %-4s %sONLINE%s %s\n' \
+        "$C_GRN" "$C_RST" "${c[0]}" "$C_RED" "$C_RST" "${c[1]}" "$C_YLW" "$C_RST" "${c[2]}" \
+        "$C_BLD" "$C_RST" "${c[3]}" "$C_CYN" "$C_RST" "${c[4]}"
+}
+
+# ========================================== 1. accounts (SSH/Dropbear) ===
 # Prompt for an existing panel account, offering the list first.
 pick_account() {
     local __var=$1 users name
@@ -55,10 +79,26 @@ pick_account() {
     printf -v "$__var" '%s' "$name"
 }
 
-# ---------------------------------------------------------- account menu ---
-account_create() {
+# Connection details to hand to the customer.
+account_summary() {
+    local user=$1 pass=$2
+    ui_line
+    ui_kv "Host/IP:" "$(sys_ip)"
+    ui_kv "Username:" "$user"
+    ui_kv "Password:" "$pass"
+    ui_kv "Expires:" "$(fmt_date "$(db_field "$user" 2)")"
+    ui_kv "Login limit:" "$(db_field "$user" 3)"
+    ui_kv "SSH ports:" "$(ssh_ports)"
+    dropbear_installed && ui_kv "Dropbear:" "$(dropbear_port)"
+    [[ -n $(wsp_ports) ]] && ui_kv "WebSocket:" "$(wsp_ports | paste -sd, -)"
+    [[ -s $STN_PORTS ]] && ui_kv "SSL/TLS:" "$(cut -d: -f1 "$STN_PORTS" | paste -sd, -)"
+    [[ -s $SQUID_PORTS ]] && ui_kv "Squid:" "$(paste -sd, "$SQUID_PORTS")"
+    ui_line
+    warn "The panel does not store passwords. Save these details now."
+}
+
+a_create() {
     local user pass days limit
-    ui_title "Create account"
     ask user "Username" || return
     valid_username "$user" || { err "Use 3-32 lowercase letters, digits, '_' or '-', starting with a letter."; return; }
     acct_os_exists "$user" && { err "User '$user' already exists."; return; }
@@ -69,67 +109,33 @@ account_create() {
     account_summary "$user" "$pass"
 }
 
-account_trial() {
+a_trial() {
     local user pass hours
-    ui_title "Create trial account"
     user="trial$(tr -dc 'a-z0-9' < /dev/urandom | head -c 4)"
     pass="$(tr -dc 'a-z0-9' < /dev/urandom | head -c 6)"
     ask user "Username" "$user" || return
     ask pass "Password" "$pass" || return
-    ask hours "Valid for (hours)" "2" || return
+    ask hours "Valid for (hours, 1-168)" "2" || return
     "$CLI" trial "$user" "$pass" "$hours" 1 || return
     account_summary "$user" "$pass"
 }
 
-# Connection details to hand to the customer.
-account_summary() {
-    local user=$1 pass=$2 port
-    ui_line
-    printf '  %-12s %s\n' "Host/IP:" "$(sys_ip)"
-    printf '  %-12s %s\n' "Username:" "$user"
-    printf '  %-12s %s\n' "Password:" "$pass"
-    printf '  %-12s %s\n' "Expires:" "$(fmt_date "$(db_field "$user" 2)")"
-    printf '  %-12s %s\n' "Logins:" "$(db_field "$user" 3)"
-    port=$(sshd -T 2>/dev/null | awk '$1=="port"{print $2}' | paste -sd, -)
-    printf '  %-12s %s\n' "SSH port:" "${port:-22}"
-    if declare -F dropbear_installed > /dev/null && dropbear_installed; then
-        printf '  %-12s %s\n' "Dropbear:" "$(dropbear_port)"
-    fi
-    ui_line
-    warn "The panel does not store passwords. Save these details now."
-}
-
-account_delete() {
-    local u; ui_title "Delete account"
-    pick_account u || return
-    confirm "Delete '$u' and close its sessions?" && "$CLI" delete "$u"
-}
-
-account_renew() {
-    local u days; ui_title "Renew account"
+a_delete()   { local u; pick_account u && confirm "Delete '$u' and close its sessions?" && "$CLI" delete "$u"; }
+a_renew()    {
+    local u days
     pick_account u || return
     printf '  Current expiry: %s\n' "$(fmt_date "$(db_field "$u" 2)")"
-    ask days "Add days" "$DEFAULT_DAYS" || return
-    "$CLI" renew "$u" "$days"
+    ask days "Add days" "$DEFAULT_DAYS" && "$CLI" renew "$u" "$days"
 }
-
-account_password() {
-    local u p; ui_title "Change password"
-    pick_account u || return
-    ask p "New password" || return
-    "$CLI" passwd "$u" "$p"
-}
-
-account_limit() {
-    local u n; ui_title "Change login limit"
+a_password() { local u p; pick_account u && ask p "New password" && "$CLI" passwd "$u" "$p"; }
+a_limit()    {
+    local u n
     pick_account u || return
     printf '  Current limit: %s\n' "$(db_field "$u" 3)"
-    ask n "New limit (0 = unlimited)" || return
-    "$CLI" limit "$u" "$n"
+    ask n "New limit (0 = unlimited)" && "$CLI" limit "$u" "$n"
 }
-
-account_lock_toggle() {
-    local u; ui_title "Lock / unlock account"
+a_lock() {
+    local u
     pick_account u || return
     if acct_is_locked "$u"; then
         confirm "'$u' is locked. Unlock it?" && "$CLI" unlock "$u"
@@ -137,180 +143,336 @@ account_lock_toggle() {
         confirm "Lock '$u' and close its sessions?" && "$CLI" lock "$u"
     fi
 }
-
-account_monitor() {
-    local key
+a_details() {
+    local u
+    "$CLI" list
+    [[ -n $(db_users) ]] || return 0
+    printf '\n'
+    ask u "Username for full details (Enter to skip)" || return 0
+    [[ -n $u ]] && { ui_line; "$CLI" info "$u"; }
+}
+a_monitor() {
+    local key rc
     while true; do
-        clear
-        ui_title "Online monitor  (refreshes every 3s, press any key to exit)"
+        clear 2>/dev/null
+        ui_title "ONLINE USERS  (refreshes every 3 s - press any key to return)"
         "$CLI" online
-        read -r -s -n 1 -t 3 key && break
+        read -r -s -n 1 -t 3 key; rc=$?
+        # Only a timeout (status > 128) refreshes; a key press or the end of
+        # input (closed SSH session) leaves the monitor.
+        (( rc > 128 )) || break
     done
 }
+a_purge()      { confirm "Delete every expired account?" && "$CLI" purge-expired; }
+a_delete_all() {
+    local word
+    [[ -n $(db_users) ]] || { info "There are no accounts."; return 0; }
+    warn "This deletes ALL $(db_users | grep -c .) panel accounts and closes their sessions."
+    ask word "Type DELETE to confirm" || return
+    [[ $word == DELETE ]] && "$CLI" delete-all || info "Cancelled."
+}
 
-account_backup_menu() {
-    local c f
-    ui_title "Backup / restore"
-    ui_item 1 "Create backup"
-    ui_item 2 "Restore from backup"
-    ui_item 0 "Back"
-    ask c "Option" || return
-    case $c in
-        1) "$CLI" backup ;;
-        2) ask f "Backup file path" || return; "$CLI" restore "$f" ;;
+# --- account limiter
+onoff() { [[ $1 == 1 ]] && echo "${C_GRN}ON${C_RST}" || echo "${C_RED}OFF${C_RST}"; }
+limiter_info() {
+    ui_kv "Guard timer:" "$(fmt_state "$(svc_state vpspanel-guard.timer)") (checks every minute)"
+    ui_kv "Expired limiter:" "$(onoff "$LIMIT_EXPIRED")"
+    ui_kv "Login limiter:" "$(onoff "$LIMIT_LOGINS")"
+    ui_kv "Auto-delete:" "$( (( AUTO_DELETE_DAYS > 0 )) && echo "$AUTO_DELETE_DAYS day(s) after expiry" || echo never)"
+}
+l_toggle() { set_config "$1" "$( [[ ${!1} == 1 ]] && echo 0 || echo 1 )" && ok "${*:2} is now $(onoff "${!1}")."; }
+l_autodel() {
+    local v
+    ask v "Delete accounts this many days after expiry (0 = never)" "$AUTO_DELETE_DAYS" || return
+    valid_int "$v" 0 3650 && set_config AUTO_DELETE_DAYS "$v" && ok "Saved." || err "Enter 0-3650."
+}
+l_log() {
+    local found
+    found=$(grep -E "  ($*)" "$VPSP_LOG" 2>/dev/null | tail -n 40)
+    if [[ -n $found ]]; then printf '%s\n' "$found"; else info "The log has no entries yet."; fi
+}
+l_clear() {
+    confirm "Remove limiter entries from the panel log?" || return 0
+    [[ -f $VPSP_LOG ]] && sed -i -E '/  (expired |limit [a-z0-9_-]+: |auto-delete )/d' "$VPSP_LOG"
+    ok "Limiter log cleared."
+}
+limiter_menu() {
+    while menu_show "ACCOUNT LIMITER" limiter_info \
+        "Expired-account limiter (on/off)|l_toggle LIMIT_EXPIRED The expired-account limiter" \
+        "Multi-login limiter (on/off)|l_toggle LIMIT_LOGINS The multi-login limiter" \
+        "Auto-delete expired accounts|l_autodel" \
+        "Expired-account log|l_log expired|auto-delete" \
+        "Multi-login log|l_log limit [a-z0-9_-]+:" \
+        "Clear limiter log|l_clear"
+    do :; done
+}
+
+# --- backups
+backup_info() {
+    ui_kv "Folder:" "$VPSP_BACKUP_DIR"
+    ui_kv "Backups:" "$(acct_backup_list | grep -c .)"
+}
+b_pick() {
+    local __v=$1 f n=0 choice
+    local -a files=()
+    while IFS= read -r f; do files+=("$f"); done < <(acct_backup_list)
+    (( ${#files[@]} )) || { info "There are no backups in $VPSP_BACKUP_DIR."; return 1; }
+    for f in "${files[@]}"; do n=$((n + 1)); ui_item "$n" "${f##*/}"; done
+    ask choice "Backup" 1 || return 1
+    valid_int "$choice" 1 "$n" || { err "Invalid choice."; return 1; }
+    printf -v "$__v" '%s' "${files[choice - 1]}"
+}
+b_list()    { local f; while IFS= read -r f; do printf '  %s  %s\n' "${f##*/}" "$(du -h "$f" | cut -f1)"; done < <(acct_backup_list); [[ -n $(acct_backup_list) ]] || info "There are no backups."; }
+b_restore() {
+    local f
+    info "You can also restore any file by path with: vpspanel restore FILE"
+    b_pick f && confirm "Restore accounts from ${f##*/}? Existing users are kept." && "$CLI" restore "$f"
+}
+b_delete()  { local f; b_pick f && confirm "Delete ${f##*/}?" && rm -f "$f" && ok "Deleted."; }
+backup_menu() {
+    while menu_show "USER BACKUPS" backup_info \
+        "Create a backup|$CLI backup" \
+        "Restore a backup|b_restore" \
+        "Delete a backup|b_delete" \
+        "List backups|b_list" \
+        "Automatic daily backups|soon"
+    do :; done
+}
+
+ssh_accounts_info() {
+    local c; read -r -a c < <(account_counts)
+    ui_kv "Accounts:" "${c[3]} total  ${C_GRN}${c[0]} active${C_RST}  ${C_RED}${c[1]} expired${C_RST}  ${C_YLW}${c[2]} locked${C_RST}"
+    ui_kv "Online now:" "${c[4]}"
+}
+
+ssh_accounts_menu() {
+    while menu_show "SSH / DROPBEAR ACCOUNTS" ssh_accounts_info \
+        "New user|a_create" \
+        "Create temporary user|a_trial" \
+        "Remove user|a_delete" \
+        "Renew user|a_renew" \
+        "Change password|a_password" \
+        "Change connection limit|a_limit" \
+        "Lock / unlock user|a_lock" \
+        "User details|a_details" \
+        "Online users monitor|>a_monitor" \
+        "Account limiter|>limiter_menu" \
+        "Delete expired users|a_purge" \
+        "Delete all users|a_delete_all" \
+        "User backups|>backup_menu" \
+        "Account mode (HWID / token)|soon" \
+        "Traffic quotas per user|soon"
+    do :; done
+}
+
+# ======================================================= 4. protocols ===
+# pline NAME STATE PORTS - one aligned protocol row.
+pline() {
+    local st
+    case $2 in
+        active) st="${C_GRN}ON ${C_RST}" ;;
+        "not installed"|"") st="${C_DIM}-- ${C_RST}" ;;
+        *) st="${C_RED}OFF${C_RST}" ;;
     esac
+    printf '%-24s %s %s' "$1" "$st" "${3:+${C_CYN}$3${C_RST}}"
 }
 
-accounts_menu() {
-    local c
-    while true; do
-        header
-        printf '  %sACCOUNT MANAGER%s\n' "$C_BLD" "$C_RST"
-        ui_item 1  "Create account"
-        ui_item 2  "Create trial account"
-        ui_item 3  "Delete account"
-        ui_item 4  "Renew account"
-        ui_item 5  "Change password"
-        ui_item 6  "Change login limit"
-        ui_item 7  "Lock / unlock account"
-        ui_item 8  "Account details"
-        ui_item 9  "List accounts"
-        ui_item 10 "Online monitor"
-        ui_item 11 "Delete all expired accounts"
-        ui_item 12 "Backup / restore"
-        ui_item 13 "Repair accounts"
-        ui_item 0  "Back"
-        ui_line
-        ask c "Option" || return
-        case $c in
-            1)  account_create; ui_pause ;;
-            2)  account_trial; ui_pause ;;
-            3)  account_delete; ui_pause ;;
-            4)  account_renew; ui_pause ;;
-            5)  account_password; ui_pause ;;
-            6)  account_limit; ui_pause ;;
-            7)  account_lock_toggle; ui_pause ;;
-            8)  local u; pick_account u && "$CLI" info "$u"; ui_pause ;;
-            9)  "$CLI" list; ui_pause ;;
-            10) account_monitor ;;
-            11) confirm "Delete every expired account?" && "$CLI" purge-expired; ui_pause ;;
-            12) account_backup_menu; ui_pause ;;
-            13) "$CLI" repair; ui_pause ;;
-            0)  return ;;
-        esac
-    done
-}
-
-# --------------------------------------------------------- protocols menu ---
 protocols_menu() {
-    local c entry unit label
+    local xports wsp stn hyp sqp wgp
     while true; do
-        header
-        printf '  %sPROTOCOLS & SERVICES%s\n' "$C_BLD" "$C_RST"
-        for entry in "${VPSP_SERVICES[@]}"; do
-            unit=${entry%%|*}; label=${entry#*|}
-            printf '    %-16s %s\n' "$label" "$(svc_state_any "$unit")"
-        done
-        ui_line
-        ui_item 1 "Dropbear"
-        ui_item 2 "Restart all panel services"
-        printf '  %s\n' "${C_DIM}Xray, WireGuard, OpenVPN, Hysteria2 and SlowDNS modules are planned.${C_RST}"
-        printf '  %s\n' "${C_DIM}See docs/ROADMAP.md.${C_RST}"
-        ui_item 0 "Back"
-        ui_line
-        ask c "Option" || return
-        case $c in
-            1) dropbear_menu ;;
-            2) for entry in "${VPSP_SERVICES[@]}"; do
-                   unit=${entry%%|*}
-                   [[ $(svc_state_any "$unit") == active ]] && systemctl restart "$unit" && ok "Restarted ${entry#*|}"
-               done
-               ui_pause ;;
-            0) return ;;
-        esac
+        wsp=$(wsp_ports | paste -sd, -)
+        stn=$( [[ -s $STN_PORTS ]] && cut -d: -f1 "$STN_PORTS" | paste -sd, - )
+        xports=$( xray_installed && jq -r '[.inbounds[].port] | map(tostring) | join(",")' "$XRAY_CONF" 2>/dev/null )
+        hyp=$( hy_installed && echo "$(hy_get PORT)/udp" )
+        sqp=$( [[ -s $SQUID_PORTS ]] && paste -sd, "$SQUID_PORTS" )
+        wgp=$( wg_installed && echo "$(wg_port)/udp" )
+        menu_show "PROTOCOL CONFIGURATION" - \
+            "$(pline "SSH (OpenSSH)" "$(svc_state "$(ssh_unit)")" "$(ssh_ports)")|>ssh_menu" \
+            "$(pline "Dropbear" "$(svc_state vpspanel-dropbear)" "$(dropbear_installed && dropbear_port)")|>dropbear_menu" \
+            "$(pline "WebSocket / HTTP proxy" "$( [[ -n $wsp ]] && echo active)" "$wsp")|>wsp_menu" \
+            "$(pline "Stunnel (SSL/TLS)" "$(svc_state vpspanel-stunnel)" "$stn")|>stunnel_menu" \
+            "SlowDNS (DNSTT)|soon" \
+            "UDP Custom|soon" \
+            "$(pline "Hysteria2 (UDP)" "$(svc_state vpspanel-hysteria)" "$hyp")|>hysteria_menu" \
+            "BadVPN UDPGW|soon" \
+            "$(pline "Squid proxy" "$( [[ -n $sqp ]] && svc_state squid)" "$sqp")|>squid_menu" \
+            "OpenVPN|soon" \
+            "$(pline "V2Ray / Xray" "$(svc_state vpspanel-xray)" "$xports")|>xray_menu" \
+            "$(pline "WireGuard" "$( wg_installed && svc_state wg-quick@wg0)" "$wgp")|>wireguard_menu" \
+            "Checkuser|soon" \
+            || return 0
     done
 }
 
-# ------------------------------------------------------------ system menu ---
-system_menu() {
-    local c tz
-    while true; do
-        header
-        printf '  %sSYSTEM TOOLS%s\n' "$C_BLD" "$C_RST"
-        printf '    Kernel %s   Uptime %s\n' "$(sys_kernel)" "$(sys_uptime)"
-        printf '    BBR: %s   Timezone: %s\n' "$(bbr_enabled && echo on || echo off)" "$(tz_current)"
-        ui_line
-        ui_item 1 "Toggle BBR congestion control"
-        ui_item 2 "Set timezone"
-        ui_item 3 "Show panel log"
-        ui_item 4 "Update system packages"
-        ui_item 5 "Reboot server"
-        ui_item 0 "Back"
-        ui_line
-        ask c "Option" || return
-        case $c in
-            1) if bbr_enabled; then bbr_disable && ok "BBR disabled."; else bbr_enable && ok "BBR enabled."; fi; ui_pause ;;
-            2) ask tz "Timezone (e.g. Europe/London, America/New_York)" "$(tz_current)" && tz_set "$tz" && ok "Timezone set."; ui_pause ;;
-            3) tail -n 40 "$VPSP_LOG" 2>/dev/null || info "The log is empty."; ui_pause ;;
-            4) confirm "Run apt-get update and upgrade now?" && apt-get update && apt-get upgrade -y; ui_pause ;;
-            5) confirm "Reboot the server now?" && reboot ;;
-            0) return ;;
-        esac
-    done
+# ====================================================== 5. extra tools ===
+maint_info() {
+    ui_kv "RAM:" "$(sys_ram)"
+    ui_kv "Swap:" "$(sys_swap)"
+    ui_kv "Disk:" "$(sys_disk)"
+}
+maintenance_menu() {
+    while menu_show "SYSTEM MAINTENANCE" maint_info \
+        "Clean RAM / cache|clean_ram" \
+        "Clean disk (apt cache, old logs, old temp files)|clean_disk" \
+        "Create swap file|swap_create" \
+        "Remove swap file|swap_remove" \
+        "Scheduled tasks|soon"
+    do :; done
 }
 
-# ---------------------------------------------------------- settings menu ---
+bbr_info() { ui_kv "BBR:" "$(bbr_enabled && echo "${C_GRN}enabled${C_RST}" || echo disabled)"; ui_kv "Kernel:" "$(sys_kernel)"; }
+bbr_toggle() { if bbr_enabled; then bbr_disable && ok "BBR disabled."; else bbr_enable && ok "BBR enabled."; fi; }
+bbr_menu() { while menu_show "BBR ACCELERATION" bbr_info "Enable / disable BBR|bbr_toggle"; do :; done; }
+
+tz_menu_set() {
+    local tz
+    info "Examples: UTC, Europe/London, America/New_York, Africa/Addis_Ababa, Asia/Dubai"
+    ask tz "Time zone" "$(tz_current)" && tz_set "$tz" && ok "Time zone set to $tz. Time now: $(date '+%F %H:%M')"
+}
+tz_info() { ui_kv "Time zone:" "$(tz_current)"; ui_kv "Local time:" "$(date '+%F %H:%M:%S')"; }
+tz_menu() { while menu_show "TIME ZONE" tz_info "Set time zone|tz_menu_set" "Use UTC|tz_set UTC"; do :; done; }
+
+extra_menu() {
+    while menu_show "EXTRA TOOLS" - \
+        "SSL certificate manager|>ssl_menu" \
+        "SSH/Dropbear banner|>banner_menu" \
+        "Root password & access|>root_menu" \
+        "System maintenance (RAM/disk/swap)|>maintenance_menu" \
+        "Block torrent, ports & keywords|>firewall_menu" \
+        "BBR acceleration|>bbr_menu" \
+        "Fail2ban|>fail2ban_menu" \
+        "DDoS protection|soon" \
+        "Time zone|>tz_menu" \
+        "Speedtest|run_speedtest" \
+        "Plugin scripts|soon"
+    do :; done
+}
+
+# ===================================================== 6. API and bots ===
+api_menu() {
+    while menu_show "API AND BOTS" - \
+        "REST API|soon" \
+        "Telegram bot|soon" \
+        "WhatsApp bot|soon"
+    do :; done
+}
+
+# =================================================== 7. panel settings ===
+sysinfo_system() {
+    ui_kv "OS:" "$(sys_os)"
+    ui_kv "Kernel:" "$(sys_kernel)"
+    ui_kv "Hostname:" "$(sys_hostname)"
+    ui_kv "IP address:" "$(sys_ip)"
+    ui_kv "Interface:" "$(sys_iface)"
+    ui_kv "Uptime:" "$(sys_uptime)"
+    ui_kv "Time zone:" "$(tz_current)"
+    ui_kv "Panel:" "VPSPanel $VPSP_VERSION in $VPSP_HOME"
+}
+sysinfo_counter() {
+    local c; read -r -a c < <(account_counts)
+    ui_kv "Active:" "${c[0]}"; ui_kv "Expired:" "${c[1]}"; ui_kv "Locked:" "${c[2]}"; ui_kv "Total:" "${c[3]}"
+    ui_kv "Online accounts:" "${c[4]}"
+    ui_kv "SSH sessions:" "$(ps -eo comm= | grep -cE '^(sshd|sshd-session)$')"
+    ui_kv "Dropbear:" "$(ps -eo comm= | grep -cx dropbear)"
+    ui_kv "TCP established:" "$(ss -tnH state established 2>/dev/null | grep -c .)"
+}
+sysinfo_ram() { free -m; printf '\n'; ui_kv "Available:" "$(meminfo_mb MemAvailable) MB"; }
+sysinfo_swap() { swapon --show 2>/dev/null; ui_kv "Swap:" "$(sys_swap)"; }
+sysinfo_diskcpu() {
+    df -h -x tmpfs -x devtmpfs -x overlay 2>/dev/null || df -h
+    printf '\n'
+    ui_kv "CPU model:" "$(awk -F': ' '/model name/ {print $2; exit}' /proc/cpuinfo)"
+    ui_kv "Cores:" "$(sys_cores)"
+    ui_kv "CPU usage:" "$(sys_cpu_pct)%"
+    ui_kv "Load average:" "$(sys_load)"
+}
+sysinfo_menu() {
+    while menu_show "SYSTEM INFORMATION" - \
+        "System information|sysinfo_system" \
+        "Connection and account counter|sysinfo_counter" \
+        "RAM memory|sysinfo_ram" \
+        "Swap memory|sysinfo_swap" \
+        "Disk and CPU|sysinfo_diskcpu"
+    do :; done
+}
+
+defaults_info() {
+    ui_kv "Default days:" "$DEFAULT_DAYS"
+    ui_kv "Default limit:" "$DEFAULT_LIMIT"
+}
+d_days()  { local v; ask v "Days" "$DEFAULT_DAYS" && { valid_int "$v" 1 3650 && set_config DEFAULT_DAYS "$v" && ok "Saved." || err "Enter 1-3650."; }; }
+d_limit() { local v; ask v "Logins (0 = unlimited)" "$DEFAULT_LIMIT" && { valid_int "$v" 0 999 && set_config DEFAULT_LIMIT "$v" && ok "Saved." || err "Enter 0-999."; }; }
+defaults_menu() {
+    while menu_show "ACCOUNT DEFAULTS" defaults_info \
+        "Default validity (days)|d_days" \
+        "Default login limit|d_limit"
+    do :; done
+}
+
+panel_log() { if [[ -s $VPSP_LOG ]]; then tail -n 40 "$VPSP_LOG"; else info "The log is empty."; fi; }
+panel_update() { "$VPSP_HOME/update.sh"; }
+panel_about() {
+    ui_kv "Version:" "$VPSP_VERSION"
+    ui_kv "Installed in:" "$VPSP_HOME"
+    ui_kv "Settings:" "$VPSP_ETC"
+    ui_kv "Log:" "$VPSP_LOG"
+    ui_kv "Source:" "$(cat "$VPSP_ETC/source" 2>/dev/null || echo "https://github.com/Chechimk/vpspanel")"
+    printf '\n  Commands: menu (this panel), vpspanel (scripting - run "vpspanel help").\n'
+}
+
+settings_info() { ui_kv "Auto-start:" "$(autostart_enabled && echo "${C_GRN}on${C_RST} (panel opens at root SSH login)" || echo off)"; }
+
 settings_menu() {
-    local c v
+    while menu_show "PANEL SETTINGS" settings_info \
+        "Auto-start panel at login (on/off)|autostart_toggle" \
+        "System information|>sysinfo_menu" \
+        "Account defaults|>defaults_menu" \
+        "Panel log|panel_log" \
+        "Update panel|panel_update" \
+        "Scheduled tasks|soon" \
+        "About VPSPanel|panel_about"
+    do :; done
+}
+
+# ========================================================== main menu ===
+uninstall_panel() {
+    if confirm "Uninstall VPSPanel?"; then
+        "$VPSP_HOME/uninstall.sh" && exit 0
+    fi
+}
+logout_vps() {
+    confirm "Close this SSH session?" || return 0
+    clear
+    kill -HUP "$PPID" 2>/dev/null || err "Could not close the session."
+    exit 0
+}
+reboot_vps() {
+    confirm "Reboot the server now? Every connection will drop." || return 0
+    info "Rebooting..."
+    log_event "reboot from panel"
+    systemctl reboot 2>/dev/null || reboot
+}
+
+# Submenus use the compact top bar and "Back".
+sub() { MENU_TOPBAR=ui_topbar MENU_ZERO_LABEL=Back; "$@"; }
+
+main_menu() {
     while true; do
-        header
-        printf '  %sPANEL SETTINGS%s\n' "$C_BLD" "$C_RST"
-        printf '    Default days: %s   Default login limit: %s\n' "$DEFAULT_DAYS" "$DEFAULT_LIMIT"
-        printf '    Auto-delete expired after: %s\n' "$( (( AUTO_DELETE_DAYS > 0 )) && echo "$AUTO_DELETE_DAYS day(s)" || echo never)"
-        printf '    SSH banner: %s\n' "$( [[ -n $BANNER_TEXT ]] && echo set || echo none)"
-        ui_line
-        ui_item 1 "Default validity (days)"
-        ui_item 2 "Default login limit"
-        ui_item 3 "Auto-delete expired accounts"
-        ui_item 4 "SSH login banner"
-        ui_item 5 "Update panel"
-        ui_item 6 "Uninstall panel"
-        ui_item 0 "Back"
-        ui_line
-        ask c "Option" || return
-        case $c in
-            1) ask v "Days" "$DEFAULT_DAYS" && { valid_int "$v" 1 3650 && set_config DEFAULT_DAYS "$v" && ok "Saved." || err "Enter 1-3650."; }; ui_pause ;;
-            2) ask v "Logins (0 = unlimited)" "$DEFAULT_LIMIT" && { valid_int "$v" 0 999 && set_config DEFAULT_LIMIT "$v" && ok "Saved." || err "Enter 0-999."; }; ui_pause ;;
-            3) ask v "Delete accounts this many days after expiry (0 = never)" "$AUTO_DELETE_DAYS" && { valid_int "$v" 0 3650 && set_config AUTO_DELETE_DAYS "$v" && ok "Saved." || err "Enter 0-3650."; }; ui_pause ;;
-            4) info "Use \\n for new lines. Leave empty to remove the banner."
-               ask v "Banner text" || continue
-               banner_apply "$v" && ok "Banner updated."; ui_pause ;;
-            5) "$VPSP_HOME/update.sh"; ui_pause ;;
-            6) if confirm "Uninstall the panel? Accounts are kept unless you choose otherwise."; then
-                   "$VPSP_HOME/uninstall.sh" && exit 0
-               fi
-               ui_pause ;;
-            0) return ;;
-        esac
+        MENU_TOPBAR=dashboard
+        MENU_ZERO_LABEL=Exit
+        menu_show "MAIN MENU" - \
+            "Manage accounts (SSH/Dropbear)|>sub ssh_accounts_menu" \
+            "Manage accounts (V2Ray/Xray)|>sub xray_users_menu" \
+            "Manage accounts (WireGuard)|>sub wireguard_clients_menu" \
+            "Protocol configuration|>sub protocols_menu" \
+            "Extra tools|>sub extra_menu" \
+            "API and bots|>sub api_menu" \
+            "Panel settings|>sub settings_menu" \
+            "Uninstall panel|uninstall_panel" \
+            "Log out of VPS|logout_vps" \
+            "Reboot VPS|reboot_vps" \
+            || { clear 2>/dev/null; exit 0; }
     done
 }
 
-# --------------------------------------------------------------- main menu ---
-while true; do
-    header
-    printf '  %sMAIN MENU%s\n' "$C_BLD" "$C_RST"
-    ui_item 1 "Account manager"
-    ui_item 2 "Protocols & services"
-    ui_item 3 "System tools"
-    ui_item 4 "Panel settings"
-    ui_item 0 "Exit"
-    ui_line
-    ask choice "Option" || exit 0
-    case $choice in
-        1) accounts_menu ;;
-        2) protocols_menu ;;
-        3) system_menu ;;
-        4) settings_menu ;;
-        0|q|exit) clear; exit 0 ;;
-    esac
-done
+[[ ${VPSP_MENU_LIB:-0} == 1 ]] || main_menu

@@ -1,0 +1,8 @@
+[Unit]
+Description=vpspanel account guard (expiry and login limits)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/vpspanel/bin/vpspanel enforce
+Nice=10

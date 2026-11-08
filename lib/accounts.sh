@@ -203,6 +203,7 @@ acct_enforce() {
                 log_event "auto-delete $u (expired ${AUTO_DELETE_DAYS}+ days)"
                 continue
             fi
+            [[ $LIMIT_EXPIRED == 1 ]] || continue
             # Expire at the OS level (shadow field 8 = 0) once, then keep sessions closed.
             if [[ $(getent shadow "$u" | cut -d: -f8) != 0 ]]; then
                 chage -E 0 "$u"
@@ -212,6 +213,7 @@ acct_enforce() {
             continue
         fi
 
+        [[ $LIMIT_LOGINS == 1 ]] || continue
         (( limit > 0 )) || continue
         n=$(acct_sessions "$u")
         (( n > limit )) || continue
@@ -223,6 +225,22 @@ acct_enforce() {
             | xargs -r kill -KILL 2>/dev/null || true
         log_event "limit $u: closed $excess session(s) over limit $limit"
     done
+}
+
+# Delete every panel account. Prints the names removed.
+acct_delete_all() {
+    local u
+    for u in $(db_users); do
+        if acct_os_exists "$u"; then acct_kill_sessions "$u"; userdel -f "$u" 2>/dev/null; fi
+        db_del "$u"
+        log_event "delete-all $u"
+        echo "$u"
+    done
+}
+
+# Backups kept by the panel, newest first.
+acct_backup_list() {
+    ls -1t "$VPSP_BACKUP_DIR"/vpspanel-backup-*.tar.gz 2>/dev/null
 }
 
 # ---------------------------------------------------------------- backup ---

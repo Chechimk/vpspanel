@@ -3,13 +3,17 @@
 # vpspanel-guard timer use the same library functions.
 set -uo pipefail
 
-VPSP_HOME=${VPSP_HOME:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)}
+VPSP_HOME=${VPSP_HOME:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}
 # shellcheck source=../lib/common.sh
 . "$VPSP_HOME/lib/common.sh"
 # shellcheck source=../lib/accounts.sh
 . "$VPSP_HOME/lib/accounts.sh"
 # shellcheck source=../lib/system.sh
 . "$VPSP_HOME/lib/system.sh"
+for m in "$VPSP_HOME"/modules/*.sh; do
+    # shellcheck source=/dev/null
+    [[ -r $m ]] && . "$m"
+done
 load_config
 
 usage() {
@@ -31,12 +35,15 @@ Accounts
   list                              List all accounts
   online                            Show accounts with open sessions
   purge-expired                     Delete all expired accounts
+  delete-all                        Delete every panel account
   repair                            Drop records of users removed outside the panel
 
 Maintenance
   enforce                           Apply expiry and login limits (run by the guard timer)
-  backup  [FILE]                    Back up accounts (default /root/vpspanel-backup-DATE.tar.gz)
+  backup  [FILE]                    Back up accounts (default $VPSP_BACKUP_DIR/vpspanel-backup-DATE.tar.gz)
   restore FILE                      Restore accounts from a backup
+  firewall-apply                    Re-apply the panel's blocking rules (run at boot)
+  cert-sync                         Refresh certificate copies (run after renewals)
   version                           Print the version
 
 Run \`menu\` for the interactive panel.
@@ -123,12 +130,22 @@ case $cmd in
     purge-expired)
         removed=$(acct_purge_expired)
         if [[ -n $removed ]]; then printf 'Deleted: %s\n' $removed; else echo "No expired accounts."; fi ;;
+    delete-all)
+        removed=$(acct_delete_all)
+        if [[ -n $removed ]]; then printf 'Deleted: %s\n' $removed; else echo "There are no accounts."; fi ;;
     repair)
         removed=$(acct_repair)
         if [[ -n $removed ]]; then printf 'Dropped: %s\n' $removed; else echo "Nothing to repair."; fi ;;
-    enforce) acct_enforce ;;
+    enforce)
+        acct_enforce
+        if declare -F xray_enforce > /dev/null; then xray_enforce; fi ;;
+    firewall-apply)
+        if declare -F fwb_apply > /dev/null; then fwb_apply; fi ;;
+    cert-sync)
+        if declare -F ssl_sync > /dev/null; then ssl_sync; fi ;;
     backup)
-        file=${1:-/root/vpspanel-backup-$(date +%Y%m%d-%H%M%S).tar.gz}
+        mkdir -p "$VPSP_BACKUP_DIR" && chmod 700 "$VPSP_BACKUP_DIR"
+        file=${1:-$VPSP_BACKUP_DIR/vpspanel-backup-$(date +%Y%m%d-%H%M%S).tar.gz}
         acct_backup "$file" && ok "Backup written to $file" ;;
     restore) need $# 1; acct_restore "$1" ;;
     *) err "Unknown command: $cmd"; usage >&2; exit 2 ;;
