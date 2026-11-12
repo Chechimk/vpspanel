@@ -342,8 +342,28 @@ YAML
         check "Hysteria2 refuses a wrong password" bash -c '! hy_client t_tun:wrongpass'
         check "expired account refused by Hysteria2" bash -c 'vpspanel create t_hyx Hyx12345 1 1 > /dev/null; f=/etc/vpspanel/accounts.db; cp $f /root/db.bak; awk -F: -v OFS=: "\$1==\"t_hyx\" {\$2=1} 1" /root/db.bak > $f; ! hy_client t_hyx:Hyx12345; r=$?; vpspanel delete t_hyx > /dev/null; exit $r'
         check "Hysteria2 screens open"            bash -c 'drive 2 7 1 k 0 0 x && no_errors && grep -q "hysteria2://USER:PASSWORD@127.0.0.1:36712,20000-20100/" /tmp/vpsp-drive.out'
+        # The client is given the panel's own share link, as a phone app would import it.
+        hy_link_client() {
+            printf 'server: "%s"\nsocks5:\n  listen: 127.0.0.1:1088\n' "$1" > /root/hyl.yaml
+            /usr/local/bin/hysteria client -c /root/hyl.yaml > /tmp/hyl.log 2>&1 & local pid=$!
+            sleep 4; socks_get 1088; local r=$?; kill "$pid" 2> /dev/null; wait "$pid" 2> /dev/null; return $r
+        }
+        export -f hy_link_client
+        # Local packets skip PREROUTING, so the port-hopping range is left out here.
+        check "account share link works in the official client" bash -c "$LIB; l=\$(hy_link t_tun Tunnel123); hy_link_client \"\${l/,20000-20100/}\""
         check "Hysteria2 uninstall"               bash -c "$LIB; hy_uninstall && ! systemctl is-active --quiet vpspanel-authd && ! iptables -t nat -S PREROUTING | grep -q vpspanel-hysteria"
-        rm -f /root/hyc.yaml
+        # Shared-password setup in the common link style: UUID password, long
+        # obfs password, SNI (certificate domain) different from the address.
+        HY_PW=$(cat /proc/sys/kernel/random/uuid); HY_OB="$(tr -dc 'A-Za-z0-9_-' < /dev/urandom | head -c 43)"
+        export HY_PW HY_OB
+        check "shared password: UUID, long obfs, SNI differs from address" bash -c "$LIB; openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 -subj /CN=test.example.org -keyout /root/hyk.pem -out /root/hyc.pem 2>/dev/null && \
+            hy_install 8445 /root/hyc.pem /root/hyk.pem 127.0.0.1 1 password \"\$HY_OB\" '' test.example.org \"\$HY_PW\" > /dev/null && sleep 2 && \
+            [[ \$(hy_link) == \"hysteria2://\$HY_PW@127.0.0.1:8445/?sni=test.example.org&insecure=1&obfs=salamander&obfs-password=\$HY_OB#vpspanel\" ]]"
+        check "shared-password share link works in the official client" bash -c "$LIB; hy_link_client \"\$(hy_link)\""
+        check "wrong shared password refused"     bash -c "$LIB; ! hy_link_client \"\$(hy_link | sed s/\$HY_PW/00000000-0000-4000-8000-000000000000/)\""
+        check "missing obfs refused"              bash -c "$LIB; ! hy_link_client \"\$(hy_link | sed 's/&obfs=salamander&obfs-password=[^#]*//')\""
+        check "Hysteria2 uninstall (shared password)" bash -c "$LIB; hy_uninstall"
+        rm -f /root/hyc.yaml /root/hyl.yaml /root/hyc.pem /root/hyk.pem
 
         section "Xray (official binary, real traffic for every protocol)"
         check "Xray install (download + checksum)" bash -c "$LIB; xray_install"

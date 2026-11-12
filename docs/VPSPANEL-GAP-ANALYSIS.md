@@ -110,7 +110,7 @@ Observation marks for the ADMRufu column follow the structure document:
 
 ## Verification of the `develop` branch (2026-11-08)
 
-`tests/run.sh` passed **167 of 167** checks on fresh Ubuntu 22.04 and Ubuntu
+`tests/run.sh` passed **173 of 173** checks on fresh Ubuntu 22.04 and Ubuntu
 24.04 containers (systemd, privileged, OpenSSH with global password login
 off, as on cloud images). Verified with **real clients and traffic**:
 
@@ -122,7 +122,7 @@ off, as on cloud images). Verified with **real clients and traffic**:
 | Stunnel, Squid | openssl s_client, raw CONNECT | TLS then SSH; Squid refuses other hosts |
 | SlowDNS | `dnstt-client` built from the same source | SSH tunnel through dnstt works |
 | OpenVPN (TCP) | OpenVPN 2.x client, panel account | connects; wrong password gets AUTH_FAILED; client file has no private key |
-| Hysteria2 | official Hysteria2 client, panel account, obfs | traffic works; wrong password and expired account refused |
+| Hysteria2 | official Hysteria2 client, panel account or shared password, obfs; also the panel's share links imported as-is | traffic works; wrong password, missing obfs, expired and locked accounts refused |
 | Xray | official Xray client from the panel's client JSON | traffic works for VLESS WS, VLESS XHTTP, VMess WS, VLESS gRPC+TLS, Trojan TCP+TLS, Shadowsocks; unknown UUID refused |
 | Checkuser | curl | `GET /` count, `POST /checkuser` expiry, 404 for unknown users |
 | DDoS protection | 12 rapid connections from one IP | about 5 accepted, the rest dropped, block listed and cleared |

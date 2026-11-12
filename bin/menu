@@ -190,7 +190,10 @@ account_summary() {
     [[ -s $SQUID_PORTS ]] && ui_kv "Squid:" "$(paste -sd' ' "$SQUID_PORTS")"
     declare -F bv_ports > /dev/null && [[ -n $(bv_ports) ]] && ui_kv "BadVPN UDPGW:" "$(bv_ports | paste -sd' ' -)"
     declare -F sdns_installed > /dev/null && sdns_installed && ui_kv "SlowDNS NS:" "$(sdns_get NS)"
-    hy_installed && [[ $(hy_get AUTH) == accounts ]] && ui_kv "Hysteria2:" "UDP $(hy_get PORT) (login with this account)"
+    if hy_installed && [[ $(hy_get AUTH) == accounts ]]; then
+        ui_kv "Hysteria2:" "UDP $(hy_get PORT) (login with this account)"
+        printf '  %s\n' "$(hy_link "$user" "$pass")"
+    fi
     declare -F ovpn_installed > /dev/null && ovpn_installed && ui_kv "OpenVPN:" "$(ovpn_get PROTO | tr a-z A-Z) $(ovpn_get PORT) (login with this account)"
     ui_line
     warn "VPSPanel does not store passwords in plain text. Save these details now."

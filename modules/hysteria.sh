@@ -8,7 +8,7 @@
 
 HY_BIN=/usr/local/bin/hysteria
 HY_DIR="$VPSP_ETC/hysteria"
-HY_SETTINGS="$HY_DIR/settings"   # PORT AUTH PASSWORD OBFS HOST INSECURE HOP
+HY_SETTINGS="$HY_DIR/settings"   # PORT AUTH PASSWORD OBFS HOST SNI INSECURE HOP
 HY_CONF="$HY_DIR/config.yaml"
 HY_UNIT=/etc/systemd/system/vpspanel-hysteria.service
 AUTHD_UNIT=/etc/systemd/system/vpspanel-authd.service
@@ -156,12 +156,19 @@ hy_restart() {
 }
 
 hy_secret() { tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "${1:-16}"; }
+# Passwords that are safe in YAML and in hysteria2:// links without escaping.
+hy_valid_secret() { [[ $1 =~ ^[A-Za-z0-9_.~-]{6,64}$ ]]; }
 
-# hy_install PORT CERT KEY HOST INSECURE [AUTH] [OBFS] [HOP]
-# AUTH: accounts (default) or password; OBFS: password or "" for none;
-# HOP: "20000:20100" or "" for no port hopping.
+# hy_install PORT CERT KEY HOST INSECURE [AUTH] [OBFS] [HOP] [SNI] [PASSWORD]
+# HOST: address put in client links (IP or domain); SNI: TLS server name
+# (default HOST); AUTH: accounts (default) or password; OBFS: password or ""
+# for none; HOP: "20000:20100" or "" for no port hopping; PASSWORD: the shared
+# password in password mode (default: a random UUID).
 hy_install() {
-    local port=$1 cert=$2 key=$3 host=$4 insecure=$5 auth=${6:-accounts} obfs=${7-$(hy_secret 8)} hop=${8:-}
+    local port=$1 cert=$2 key=$3 host=$4 insecure=$5 auth=${6:-accounts} obfs=${7-$(hy_secret 24)} hop=${8:-}
+    local sni=${9:-$4} pass=${10:-$(cat /proc/sys/kernel/random/uuid)}
+    hy_valid_secret "$pass" || { err "The password may use 6-64 letters, digits, '_', '.', '-' or '~'."; return 1; }
+    [[ -z $obfs ]] || hy_valid_secret "$obfs" || { err "The obfs password may use 6-64 letters, digits, '_', '.', '-' or '~'."; return 1; }
     has_systemd || { err "Hysteria management requires systemd."; return 1; }
     has_cmd iptables || apt_install iptables || return 1
     [[ -x $HY_BIN ]] || hy_download || return 1
@@ -169,8 +176,8 @@ hy_install() {
     mkdir -p "$HY_DIR" && chmod 750 "$HY_DIR" && chgrp "$VPSP_SVC_USER" "$HY_DIR"
     ssl_copy "$cert" "$key" "$HY_DIR/tls" "$VPSP_SVC_USER" || return 1
     : > "$HY_SETTINGS"
-    hy_set PORT "$port"; hy_set AUTH "$auth"; hy_set PASSWORD "$(hy_secret 16)"; hy_set OBFS "$obfs"
-    hy_set HOST "$host"; hy_set INSECURE "$insecure"; hy_set HOP "$hop"
+    hy_set PORT "$port"; hy_set AUTH "$auth"; hy_set PASSWORD "$pass"; hy_set OBFS "$obfs"
+    hy_set HOST "$host"; hy_set SNI "$sni"; hy_set INSECURE "$insecure"; hy_set HOP "$hop"
     hy_write_conf
     hy_write_unit
     if [[ $auth == accounts ]]; then run_step "systemctl start vpspanel-authd" authd_ensure || return 1; fi
@@ -192,25 +199,44 @@ hy_uninstall() {
     ok "Hysteria2 removed."
 }
 
-hy_show_client() {
-    local host port pass obfs insecure q hop auth ports
-    host=$(hy_get HOST); port=$(hy_get PORT); obfs=$(hy_get OBFS); insecure=$(hy_get INSECURE)
-    hop=$(hy_get HOP); auth=$(hy_get AUTH)
-    if [[ $auth == accounts ]]; then pass='USER:PASSWORD'; else pass=$(hy_get PASSWORD); fi
-    q="sni=$host"
+uri_enc() { jq -rn --arg v "$1" '$v|@uri'; }
+
+# hy_link [USER PASSWORD] - the hysteria2:// share link. In accounts mode it
+# is built for USER/PASSWORD (or USER:PASSWORD placeholders when omitted).
+# Format: hysteria2://AUTH@HOST:PORT[,HOP]/?sni=..&insecure=1&obfs=salamander&obfs-password=..#NAME
+hy_link() {
+    local host port sni obfs insecure hop auth ports q name
+    host=$(hy_get HOST); port=$(hy_get PORT); sni=$(hy_get SNI); obfs=$(hy_get OBFS)
+    insecure=$(hy_get INSECURE); hop=$(hy_get HOP); sni=${sni:-$host}
+    if [[ $(hy_get AUTH) == accounts ]]; then
+        if [[ -n ${1:-} ]]; then auth="$(uri_enc "$1"):$(uri_enc "$2")"; name=$1; else auth='USER:PASSWORD'; name=vpspanel; fi
+    else
+        auth=$(uri_enc "$(hy_get PASSWORD)"); name=vpspanel
+    fi
+    q="sni=$(uri_enc "$sni")"
     [[ $insecure == 1 ]] && q+="&insecure=1"
-    [[ -n $obfs ]] && q+="&obfs=salamander&obfs-password=$obfs"
+    [[ -n $obfs ]] && q+="&obfs=salamander&obfs-password=$(uri_enc "$obfs")"
     ports=$port; [[ -n $hop ]] && ports="$port,${hop/:/-}"
+    [[ $host == *:* ]] && host="[$host]"          # IPv6 address
+    printf 'hysteria2://%s@%s:%s/?%s#%s\n' "$auth" "$host" "$ports" "$q" "$(uri_enc "$name")"
+}
+
+hy_show_client() {
+    local obfs auth
+    obfs=$(hy_get OBFS); auth=$(hy_get AUTH)
     ui_line
     ui_kv "Version:" "Hysteria v2"
-    ui_kv "Server:" "$host:$port (UDP)"
-    [[ -n $hop ]] && ui_kv "Port hopping:" "${hop/:/-} > $port"
+    ui_kv "Server:" "$(hy_get HOST):$(hy_get PORT) (UDP)"
+    ui_kv "SNI:" "$(hy_get SNI || true)"
+    [[ -n $(hy_get HOP) ]] && ui_kv "Port hopping:" "$(hy_get HOP | tr : -) > $(hy_get PORT)"
     if [[ $auth == accounts ]]; then ui_kv "Login:" "a panel SSH account (user:password)"
     else ui_kv "Password:" "$(hy_get PASSWORD)"; fi
     ui_kv "Obfuscation:" "${obfs:+salamander / $obfs}${obfs:-none}"
-    ui_kv "TLS check:" "$([[ $insecure == 1 ]] && echo "skip (self-signed certificate)" || echo verify)"
-    printf '\n  hysteria2://%s@%s:%s/?%s#vpspanel\n' "$pass" "$host" "$ports" "$q"
-    [[ $auth == accounts ]] && info "Replace USER:PASSWORD with the customer's account."
+    ui_kv "TLS check:" "$([[ $(hy_get INSECURE) == 1 ]] && echo "skip (insecure=1, self-signed certificate)" || echo verify)"
+    printf '\n  %s\n' "$(hy_link)"
+    if [[ $auth == accounts ]]; then
+        info "Replace USER:PASSWORD with the customer's account. New accounts get a ready link."
+    fi
 }
 
 # ------------------------------------------------------------------ menu ---
@@ -218,11 +244,21 @@ hy_info() {
     if hy_installed; then
         printf ' %sVERSION:%s HYSTERIA V2   %sPORT:%s %s   %sLOGIN:%s %s\n' "$C_GRN" "$C_RST" "$C_GRN" "$C_RST" "$(hy_get PORT)" \
             "$C_GRN" "$C_RST" "$( [[ $(hy_get AUTH) == accounts ]] && echo "SSH accounts" || echo "shared password")"
+        printf ' %sADDRESS:%s %s   %sSNI:%s %s\n' "$C_GRN" "$C_RST" "$(hy_get HOST)" "$C_GRN" "$C_RST" "$(hy_get SNI || true)"
         [[ -n $(hy_get HOP) ]] && printf ' %sREDIRECT:%s %s > %s\n' "$C_GRN" "$C_RST" "$(hy_get HOP)" "$(hy_get PORT)"
         printf ' %sOBFS:%s %s\n' "$C_GRN" "$C_RST" "$(hy_get OBFS || true)"
     else
         ui_center "HYSTERIA V2 - LOGIN WITH PANEL SSH ACCOUNTS" "$C_YLW"
     fi
+}
+
+hy_ask_secret() {   # hy_ask_secret VAR "Prompt" DEFAULT [allow-empty]
+    local __v=$1 __s
+    while true; do
+        ask __s "$2" "$3" || return 1
+        if [[ -z $__s && ${4:-} == allow-empty ]] || hy_valid_secret "$__s"; then printf -v "$__v" '%s' "$__s"; return 0; fi
+        err "Use 6-64 letters, digits, '_', '.', '-' or '~'."
+    done
 }
 
 hy_ask_hop() {
@@ -240,18 +276,23 @@ hy_ask_hop() {
 }
 
 m_hy_install() {
-    local port cert key host insecure=0 auth=accounts obfs hop a
-    ask_port port "UDP port" 36712 udp || return
+    local port cert key host sni insecure=0 auth=accounts obfs='' hop a pass=''
+    clear 2>/dev/null; ui_title "UDP-HYSTERIA INSTALLER"
+    ask_port port "UDP PORT" 36712 udp || return
     hy_ask_hop hop || return
-    ask a "Login with [1] panel SSH accounts or [2] one shared password" 1 || return
-    [[ $a == 2 ]] && auth=password
-    obfs=$(hy_secret 8)
-    confirm "Enable Salamander obfuscation (recommended)?" || obfs=''
+    ui_item 1 "LOGIN WITH PANEL SSH ACCOUNTS (user:password)"; ui_item 2 "ONE SHARED PASSWORD"; ui_line
+    ask a "Enter an option" 1 || return
+    if [[ $a == 2 ]]; then auth=password; hy_ask_secret pass "SHARED PASSWORD" "$(cat /proc/sys/kernel/random/uuid)" || return; fi
+    if confirm "Enable Salamander obfuscation (recommended)?"; then
+        hy_ask_secret obfs "OBFS PASSWORD" "$(hy_secret 24)" || return
+    fi
     ssl_pick cert key || return
     [[ $cert == "$SSL_SELF"/* ]] && insecure=1
-    host=$(openssl x509 -noout -subject -in "$cert" 2>/dev/null | sed -n 's/.*CN *= *//p')
-    ask host "Address clients connect to" "${host:-$(sys_ip)}" || return
-    hy_install "$port" "$cert" "$key" "$host" "$insecure" "$auth" "$obfs" "$hop"
+    sni=$(openssl x509 -noout -subject -in "$cert" 2>/dev/null | sed -n 's/.*CN *= *//p')
+    ask host "ADDRESS clients connect to (IP or domain)" "$(sys_ip)" || return
+    ask sni "SNI (TLS server name; the domain on the certificate)" "${sni:-$host}" || return
+    valid_domain "$sni" || [[ $sni =~ ^[0-9.]+$ ]] || { err "Invalid SNI."; return 1; }
+    hy_install "$port" "$cert" "$key" "$host" "$insecure" "$auth" "$obfs" "$hop" "$sni" "$pass"
 }
 
 m_hy_port() {
@@ -268,6 +309,14 @@ m_hy_hop() {
     hy_set HOP "$h" && hy_restart && { [[ -z $h ]] || fw_allow "$h" udp; } && ok "Port hopping: ${h:-off}."
 }
 
+m_hy_addr() {
+    local h s
+    ask h "Address clients connect to (IP or domain)" "$(hy_get HOST)" || return
+    ask s "SNI (TLS server name)" "$(hy_get SNI || true)" || return
+    valid_domain "$s" || [[ $s =~ ^[0-9.]+$ ]] || { err "Invalid SNI."; return 1; }
+    hy_set HOST "$h" && hy_set SNI "$s" && ok "Saved. New link:" && hy_link
+}
+
 m_hy_auth() {
     if [[ $(hy_get AUTH) == accounts ]]; then
         confirm "Switch to one shared password for every client?" || return 0
@@ -281,16 +330,14 @@ m_hy_auth() {
 
 m_hy_pass() {
     local p
-    ask p "New shared password (leave the default for a random one)" "$(hy_secret 16)" || return
-    [[ $p =~ ^[A-Za-z0-9_.-]{6,64}$ ]] || { err "Use 6-64 letters, digits, '_', '.' or '-'."; return 1; }
+    hy_ask_secret p "New shared password" "$(cat /proc/sys/kernel/random/uuid)" || return
     hy_set PASSWORD "$p" && hy_restart && ok "Password changed. Update your clients."
 }
 
 m_hy_obfs() {
     local p
     info "Leave empty to turn obfuscation off."
-    ask p "Salamander obfuscation password" "$(hy_secret 8)" || return
-    [[ -z $p || $p =~ ^[A-Za-z0-9_.-]{6,64}$ ]] || { err "Use 6-64 letters, digits, '_', '.' or '-'."; return 1; }
+    hy_ask_secret p "Salamander obfuscation password" "$(hy_secret 24)" allow-empty || return
     hy_set OBFS "$p" && hy_restart && ok "Obfuscation ${p:+enabled}${p:-disabled}."
 }
 
@@ -312,6 +359,7 @@ hysteria_menu() {
                    -
                    "CHANGE PORT|m_hy_port"
                    "PORT HOPPING RANGE|m_hy_hop"
+                   "ADDRESS AND SNI IN LINKS|m_hy_addr"
                    "MODIFY OBFS|m_hy_obfs"
                    "LOGIN METHOD (ACCOUNTS / SHARED PASSWORD)|m_hy_auth")
             [[ $(hy_get AUTH) == accounts ]] || items+=("CHANGE SHARED PASSWORD|m_hy_pass")
