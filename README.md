@@ -118,7 +118,7 @@ panel from anywhere.
 | Squid | HTTP CONNECT proxy restricted to this server only. Logs. The original config is restored on removal |
 | OpenVPN | TCP or UDP, port, cipher, DNS choice. **Clients log in with their panel SSH account** (PAM; expired and locked accounts are refused). One client file, which contains no private key |
 | Checkuser | Same HTTP API as ADMRufu (`GET /` online count, `POST /checkuser {"user":...}` expiry as DDMMYYYY or epoch, UTC or server time); runs unprivileged |
-| V2Ray / Xray | Official Xray-core release, SHA-256 verified, unprivileged. VLESS, VMess, Trojan, Shadowsocks over TCP, WebSocket, gRPC or XHTTP, TLS on or off. Users are added to every inbound with expiry; share links, QR codes and a complete client JSON. View/edit JSON, logs |
+| V2Ray / Xray | Official Xray-core release, SHA-256 verified, unprivileged. A step-by-step wizard (Back at every step) built from a compatibility table checked against Xray-core v26.11: **VLESS, VMess, Trojan, Shadowsocks (AEAD and 2022), Hysteria2 (Xray-native), MASQUE**, plus SOCKS5, HTTP/HTTPS proxy and Tunnel (dokodemo-door); transports **RAW (+HTTP header), XHTTP (incl. HTTP/3), gRPC, WebSocket, HTTPUpgrade, mKCP (FinalMask obfuscation), Hysteria, MASQUE**; security **none, TLS (SNI, ALPN, min version, fingerprint), REALITY (generated keys, short ID, SpiderX)**; **Vision flow** only where valid (client-only `-udp443`); **VLESS Encryption**. Add, edit, view, enable/disable, remove. Users with expiry in every inbound; share links, QR codes and complete client JSON. Every change is tested with `xray run -test` and rolled back if Xray does not start. See [docs/XRAY-COMPATIBILITY.md](docs/XRAY-COMPATIBILITY.md) |
 | WireGuard | Server with NAT, clients with config + QR code, port change, NAT re-detection |
 | SSL | Let's Encrypt via certbot (auto-renewal refreshes service copies) and self-signed certificates |
 | Security | Torrent/keyword and spam-port blocking that only affects panel traffic, UFW helpers, Fail2ban (your own IP is never banned), DDoS protection (new connections per minute per IP, block minutes, whitelist) |
@@ -126,8 +126,8 @@ panel from anywhere.
 
 ## Coming Soon
 
-UDP-Custom, FileBrowser, HWID/token account modes, Xray traffic accounting
-and REALITY, SSH post-login banner with account details, manually pasted
+UDP-Custom, FileBrowser, HWID/token account modes, Xray traffic accounting,
+SSH post-login banner with account details, manually pasted
 certificates, scheduled tasks, plugin scripts, REST API, Telegram bot,
 WhatsApp bot. Details are in [docs/ROADMAP.md](docs/ROADMAP.md).
 
@@ -176,9 +176,11 @@ covers:
 - the account lifecycle, temporary users, auto-backup and ADMRufu import
 - real SSH tunnels through OpenSSH, Dropbear (two ports), the direct proxy,
   the CONNECT proxy, Stunnel, Squid and SlowDNS (with a real `dnstt-client`)
-- real client traffic through OpenVPN, Hysteria2 and Xray (VLESS WS, VLESS
-  XHTTP, VMess WS, VLESS gRPC+TLS, Trojan TCP+TLS, Shadowsocks), each logging
-  in with a panel account or user, and refusals for wrong credentials
+- real client traffic through OpenVPN and Hysteria2 (logging in with a panel
+  account) and through 35 Xray configurations covering every protocol,
+  transport and security option (see docs/XRAY-COMPATIBILITY.md); refusals
+  for wrong credentials, expired users and 18 invalid Xray combinations;
+  Xray edits, enable/disable, rollback, locking and migration
 - login-limit enforcement, Checkuser API, DDoS rate limiting, WireGuard
 
 ```bash

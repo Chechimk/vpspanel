@@ -24,9 +24,11 @@ ssl_list() {
 ssl_expiry() { openssl x509 -enddate -noout -in "$1" 2>/dev/null | sed 's/^notAfter=//'; }
 
 ssl_selfsigned() {
-    local cn=${1:-$(sys_ip)}
+    local cn=${1:-$(sys_ip)} san
     mkdir -p "$SSL_SELF" && chmod 700 "$SSL_SELF"
-    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=$cn" \
+    # Modern TLS clients ignore the Common Name: put the name in a SAN too.
+    if [[ $cn =~ ^[0-9.]+$ || $cn == *:* ]]; then san="IP:$cn"; else san="DNS:$cn"; fi
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=$cn" -addext "subjectAltName=$san" \
         -keyout "$SSL_SELF/privkey.pem" -out "$SSL_SELF/fullchain.pem" > /dev/null 2>&1 \
         || { err "openssl failed to create the certificate."; return 1; }
     chmod 600 "$SSL_SELF/privkey.pem"
@@ -104,7 +106,7 @@ ssl_copy() {
 # Refresh every copy from its source and restart the services using them.
 ssl_sync() {
     local src dir cert key
-    for src in "$VPSP_ETC"/*/tls/source; do
+    for src in "$VPSP_ETC"/*/tls/source "$VPSP_ETC"/*/tls/*/source; do   # per-inbound copies too
         [[ -f $src ]] || continue
         dir=$(dirname "$src")
         { read -r cert; read -r key; } < "$src"

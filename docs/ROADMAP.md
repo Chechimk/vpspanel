@@ -16,7 +16,7 @@ comparison with ADMRufu2.0 is in [VPSPANEL-GAP-ANALYSIS.md](VPSPANEL-GAP-ANALYSI
 - **UDP-Custom**: ADMRufu ships a closed-source binary; an open-source server
   that speaks the same client protocol has not been identified.
 - **FileBrowser** (open-source web file manager).
-- **Xray**: traffic accounting (stats API), REALITY inbounds.
+- **Xray**: traffic accounting (stats API). REALITY, VLESS Encryption and the other transports are implemented (see XRAY-COMPATIBILITY.md).
 
 ## Tools
 - Manually pasted (or downloaded .zip) certificates in the SSL manager.

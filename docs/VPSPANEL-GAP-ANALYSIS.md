@@ -68,9 +68,9 @@ Observation marks for the ADMRufu column follow the structure document:
 | Checkuser | 🔬 `GET /` online count, `POST /checkuser` expiry; UTC/local; DDMMYYYY/epoch | Coming Soon | Original Python service with the same API | P1 | Done |
 | ATKEN, HCR, BHTTP, SSHGO | ✅ closed binaries | — | — | P3 | Not planned |
 | FileBrowser | ✅ | — | Open-source; low priority | P2 | Coming Soon |
-| Xray protocols | 🔬 VMess, VLESS, SOCKS, Trojan, Shadowsocks | VLESS, VMess | Add Trojan, Shadowsocks | P1 | Done |
-| Xray transports | 🔬 TCP (+HTTP camouflage), gRPC, WebSocket, XHTTP; TLS on/off | WS, WS+TLS, TCP+TLS | gRPC and XHTTP, TLS on/off for each | P1 | Done |
-| Xray REALITY | 🔬 not offered | — | Not in ADMRufu either | P2 | Coming Soon |
+| Xray protocols | 🔬 VMess, VLESS, SOCKS, Trojan, Shadowsocks | VLESS, VMess | Add Trojan, Shadowsocks (AEAD + 2022), SOCKS5, HTTP, Hysteria2 (Xray), MASQUE, Tunnel | P1 | Done |
+| Xray transports | 🔬 TCP (+HTTP camouflage), gRPC, WebSocket, XHTTP; TLS on/off | WS, WS+TLS, TCP+TLS | gRPC and XHTTP, TLS on/off for each | P1 | Done (plus HTTPUpgrade, mKCP, XHTTP over HTTP/3, Vision, VLESS Encryption; see XRAY-COMPATIBILITY.md) |
+| Xray REALITY | 🔬 not offered | — | REALITY with generated keys, short IDs, SpiderX (beyond ADMRufu) | P1 | Done |
 | Xray users | 🔬 per inbound, expiry, link + client JSON, reset stats | all inbounds, expiry, links | Client JSON; QR | P1 | Done |
 | Xray traffic stats | 🔬 timer every 30 s | — | Stats API + per-user totals | P2 | Coming Soon |
 | Xray view/edit JSON, logs | 🔬 | — | Add | P1 | Done |
@@ -110,7 +110,7 @@ Observation marks for the ADMRufu column follow the structure document:
 
 ## Verification of the `develop` branch (2026-11-08)
 
-`tests/run.sh` passed **173 of 173** checks on fresh Ubuntu 22.04 and Ubuntu
+`tests/run.sh` passed **265 of 265** checks (116 of them for Xray) on fresh Ubuntu 22.04 and Ubuntu
 24.04 containers (systemd, privileged, OpenSSH with global password login
 off, as on cloud images). Verified with **real clients and traffic**:
 

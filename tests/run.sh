@@ -18,7 +18,7 @@ static_tests() {
     section "Static checks"
     local f
     for f in "$ROOT"/bin/menu "$ROOT"/bin/vpspanel "$ROOT"/bin/vpspanel-dropbear "$ROOT"/lib/*.sh "$ROOT"/modules/*.sh \
-             "$ROOT"/install.sh "$ROOT"/quick-install.sh "$ROOT"/update.sh "$ROOT"/uninstall.sh "$ROOT"/tests/run.sh; do
+             "$ROOT"/install.sh "$ROOT"/quick-install.sh "$ROOT"/update.sh "$ROOT"/uninstall.sh "$ROOT"/tests/run.sh "$ROOT"/tests/xray.sh; do
         check "bash -n ${f#"$ROOT"/}" bash -n "$f"
     done
     for f in vpspanel-wsproxy vpspanel-authd vpspanel-checkuser; do
@@ -223,6 +223,8 @@ tunnel_tests() {
 # ------------------------------------------------------------ protocols ---
 LIB="export VPSP_HOME=/opt/vpspanel; . /opt/vpspanel/lib/common.sh; . /opt/vpspanel/lib/accounts.sh; . /opt/vpspanel/lib/system.sh; . /opt/vpspanel/lib/ui.sh; for m in /opt/vpspanel/modules/*.sh; do . \$m; done; load_config"
 export LIB
+# shellcheck source=tests/xray.sh
+. "$ROOT/tests/xray.sh"
 
 # http_probe PORT REQUEST EXPECT... - send REQUEST, assert every EXPECT is in the reply.
 http_probe() {
@@ -365,35 +367,7 @@ YAML
         check "Hysteria2 uninstall (shared password)" bash -c "$LIB; hy_uninstall"
         rm -f /root/hyc.yaml /root/hyl.yaml /root/hyc.pem /root/hyk.pem
 
-        section "Xray (official binary, real traffic for every protocol)"
-        check "Xray install (download + checksum)" bash -c "$LIB; xray_install"
-        check "inbounds: VLESS WS, VLESS XHTTP, VMess WS, VLESS gRPC+TLS, Trojan TCP+TLS, Shadowsocks" bash -c "$LIB; \
-            xray_add_inbound vless ws 8880 /vw 0 127.0.0.1 '' '' t-vless-ws && \
-            xray_add_inbound vless xhttp 8881 /vx 0 127.0.0.1 '' '' t-vless-xhttp && \
-            xray_add_inbound vmess ws 8882 /vm 0 127.0.0.1 '' '' t-vmess-ws && \
-            xray_add_inbound vless grpc 8443 svc 1 127.0.0.1 \$SSL_SELF/fullchain.pem \$SSL_SELF/privkey.pem t-vless-grpc && \
-            xray_add_inbound trojan tcp 8444 '' 1 127.0.0.1 \$SSL_SELF/fullchain.pem \$SSL_SELF/privkey.pem t-trojan && \
-            xray_add_inbound shadowsocks tcp 8445 '' 0 127.0.0.1 '' '' t-ss && sleep 1 && systemctl is-active --quiet vpspanel-xray"
-        check "user added to every inbound"       bash -c "$LIB; xray_user_add t_ray 2 && [[ \$(jq '[.inbounds[].settings.clients[] | select(.email==\"t_ray\")] | length' \$XRAY_CONF) == 6 ]]"
-        check "share links for every protocol"    bash -c "$LIB; out=\$(xray_links t_ray); for s in vless:// vmess:// trojan:// ss:// 'type=grpc' 'type=xhttp'; do grep -q \"\$s\" <<< \"\$out\" || { echo missing \$s; exit 1; }; done"
-        xray_traffic() { # xray_traffic TAG - run a client from the panel's client JSON, fetch a page
-            . /dev/stdin <<< "$LIB"
-            local pin; pin=$(openssl x509 -in "$SSL_SELF/fullchain.pem" -outform der | sha256sum | cut -d" " -f1)
-            xray_client_json t_ray "$1" | jq --arg pin "$pin" '.inbounds[0].port = 1089
-                | if .outbounds[0].streamSettings.tlsSettings then .outbounds[0].streamSettings.tlsSettings += {pinnedPeerCertSha256: $pin} else . end' > /root/xc.json
-            (XRAY_LOCATION_ASSET=/usr/local/share/xray /usr/local/bin/xray run -c /root/xc.json > /tmp/xc.log 2>&1 &); sleep 3
-            socks_get 1089; local r=$?; killp "xray run -c /root/xc.json"; sleep 1; return $r
-        }
-        export -f xray_traffic
-        for t in t-vless-ws t-vless-xhttp t-vmess-ws t-vless-grpc t-trojan t-ss; do
-            check "real traffic: $t" bash -c "xray_traffic $t || { tail -n 5 /tmp/xc.log; false; }"
-        done
-        check "unknown user refused"              bash -c ". /dev/stdin <<< \"\$LIB\"; xray_client_json t_ray t-vless-ws | jq '.inbounds[0].port = 1089 | .outbounds[0].settings.vnext[0].users[0].id = \"00000000-0000-4000-8000-000000000000\"' > /root/xc.json; (/usr/local/bin/xray run -c /root/xc.json > /dev/null 2>&1 &); sleep 3; ! socks_get 1089; r=\$?; killp 'xray run -c /root/xc.json'; exit \$r"
-        check "renew = today + days"              bash -c "$LIB; xray_user_renew t_ray 5 && [[ \$(date -d @\$(awk -F: '\$1==\"t_ray\" {print \$3}' \$XRAY_USERS) +%F) == \$(date -d '+5 days' +%F) ]]"
-        check "Xray screens open"                 bash -c 'drive 1 0 2 4 1 n n k 0 x && no_errors && grep -q "V2RAY AND XRAY USER ADMINISTRATION" /tmp/vpsp-drive.out && grep -q "t_ray" /tmp/vpsp-drive.out'
-        check "expired user removed by the guard" bash -c "$LIB; VPSP_NOW=\$(( \$(date +%s) + 9 * 86400 )) xray_enforce; ! jq -e '.inbounds[].settings.clients[] | select(.email==\"t_ray\")' \$XRAY_CONF"
-        check "Xray uninstall"                    bash -c "$LIB; xray_uninstall"
-        rm -f /root/xc.json
+        xray_tests
     fi
 
     section "WireGuard"
@@ -423,6 +397,7 @@ if [[ ${1:-} != static ]]; then
         nav)       navigation_tests ;;
         accounts)  account_tests ;;
         protocols) tunnel_tests; ssh_like_protocols; udp_and_vpn_protocols ;;
+        xray)      xray_tests ;;
         *)         navigation_tests; account_tests; tunnel_tests; ssh_like_protocols; udp_and_vpn_protocols ;;
     esac
     vpspanel delete-all > /dev/null 2>&1
